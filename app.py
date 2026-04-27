@@ -332,12 +332,17 @@ st.caption("Ranking de ativos e índices setoriais por performance relativa cont
 with st.sidebar:
     st.header("Configuração")
     source_mode = st.radio("Universo de ativos", ["Carteira IBOV automática B3", "Lista manual", "Upload CSV"], index=0)
-    benchmark = st.text_input("Benchmark", value="^BVSP", help="Yahoo Finance: ^BVSP para Ibovespa.")
+    benchmark_input = st.text_input("Benchmark", value="^BVSP", help="Yahoo Finance: ^BVSP para Ibovespa.")
     start = st.date_input("Data inicial", value=date.today() - timedelta(days=370))
     end = st.date_input("Data final", value=date.today())
-    windows = st.multiselect("Janelas de ranking", [5, 20, 60, 120, 252], default=[5, 20, 60, 120])
+    windows_input = st.multiselect("Janelas de ranking", [5, 20, 60, 120, 252], default=[5, 20, 60, 120])
     top_n = st.slider("Quantidade no gráfico", min_value=5, max_value=40, value=15)
     manual_text = st.text_area("Lista manual de ativos", value="PETR4, VALE3, ITUB4, BBAS3, BBDC4, BPAC11, PRIO3")
+
+    uploaded = None
+    if source_mode == "Upload CSV":
+        uploaded = st.file_uploader("CSV com coluna ticker", type=["csv"])
+
     st.markdown("---")
     st.subheader("Índices setoriais")
     st.caption("A análise setorial usa somente: IFNC, IMAT, ICON, UTIL e IMOB.")
@@ -352,38 +357,107 @@ with st.sidebar:
     else:
         sector_text = "\n".join([f"{name},{ticker}" for name, ticker in SECTOR_INDICES.items()])
         st.dataframe(pd.DataFrame([{"Índice": name, "Ticker Yahoo": ticker} for name, ticker in SECTOR_INDICES.items()]), width="stretch", hide_index=True)
+
     run = st.button("Atualizar análise", type="primary")
 
-if not run:
+
+def resolve_tickers(source_mode: str, manual_text: str, uploaded_file) -> List[str]:
+    if source_mode == "Carteira IBOV automática B3":
+        try:
+            ibov_df = fetch_b3_index_portfolio("IBOV")
+            tickers = ibov_df["ticker"].tolist() if not ibov_df.empty else FALLBACK_IBOV
+            if ibov_df.empty:
+                st.warning("Não consegui ler a carteira da B3. Usei a lista fallback editável no código.")
+            return tickers
+        except Exception as e:
+            st.warning(f"Falha ao buscar carteira automática da B3: {e}. Usei fallback local.")
+            return FALLBACK_IBOV
+    if source_mode == "Lista manual":
+        return parse_manual_list(manual_text)
+    if uploaded_file is None:
+        st.warning("Envie um CSV com a coluna ticker e clique em Atualizar análise.")
+        return []
+    csv = pd.read_csv(uploaded_file)
+    col = "ticker" if "ticker" in csv.columns else csv.columns[0]
+    return csv[col].astype(str).str.upper().tolist()
+
+
+def parse_sector_tickers(sector_text: str) -> Dict[str, str]:
+    allowed_sector_codes = {"IFNC", "IMAT", "ICON", "UTIL", "IMOB"}
+    sector_tickers = {}
+    for line in sector_text.splitlines():
+        if not line.strip() or "," not in line:
+            continue
+        name, tk = line.split(",", 1)
+        code = name.strip().split(" - ")[0].upper()
+        if code in allowed_sector_codes:
+            sector_tickers[name.strip()] = tk.strip()
+    return sector_tickers
+
+
+if "analysis_ready" not in st.session_state:
+    st.session_state.analysis_ready = False
+
+if run:
+    try:
+        benchmark = benchmark_input.strip()
+        windows = windows_input
+        tickers_br = resolve_tickers(source_mode, manual_text, uploaded)
+        if not tickers_br:
+            st.stop()
+
+        asset_yahoo = br_to_yahoo(tickers_br)
+        all_asset_tickers = tuple(sorted(set(asset_yahoo + [benchmark])))
+        prices, used_tickers, failed_tickers = download_prices(all_asset_tickers, start, end)
+        ranking, rs_curves = calc_metrics(prices, benchmark, windows)
+
+        sector_tickers = parse_sector_tickers(sector_text)
+        sector_all = tuple(sorted(set(list(sector_tickers.values()) + [benchmark])))
+        sector_prices, sector_used_tickers, sector_failed_tickers = download_prices(sector_all, start, end)
+        sector_ranking, sector_rs = calc_metrics(sector_prices, benchmark, windows)
+        if not sector_ranking.empty:
+            inverse = {yahoo_to_br(v): k for k, v in sector_tickers.items()}
+            sector_ranking["Índice"] = sector_ranking["Ativo"].map(inverse).fillna(sector_ranking["Ativo"])
+
+        st.session_state.analysis_data = {
+            "prices": prices,
+            "ranking": ranking,
+            "rs_curves": rs_curves,
+            "benchmark": benchmark,
+            "windows": windows,
+            "failed_tickers": failed_tickers,
+            "sector_prices": sector_prices,
+            "sector_ranking": sector_ranking,
+            "sector_rs": sector_rs,
+            "sector_used_tickers": sector_used_tickers,
+            "sector_failed_tickers": sector_failed_tickers,
+            "sector_tickers": sector_tickers,
+        }
+        st.session_state.analysis_ready = True
+        st.success("Dados atualizados e armazenados na sessão. Agora você pode trocar o ativo no indicador sem recalcular.")
+    except Exception as e:
+        st.error(f"Erro ao atualizar a análise: {e}")
+        st.exception(e)
+        st.stop()
+
+if not st.session_state.analysis_ready:
     st.info("Configure os parâmetros na lateral e clique em Atualizar análise.")
     st.stop()
 
 try:
-    if source_mode == "Carteira IBOV automática B3":
-        try:
-            ibov_df = fetch_b3_index_portfolio("IBOV")
-            tickers_br = ibov_df["ticker"].tolist() if not ibov_df.empty else FALLBACK_IBOV
-            if ibov_df.empty:
-                st.warning("Não consegui ler a carteira da B3. Usei a lista fallback editável no código.")
-        except Exception as e:
-            st.warning(f"Falha ao buscar carteira automática da B3: {e}. Usei fallback local.")
-            tickers_br = FALLBACK_IBOV
-    elif source_mode == "Lista manual":
-        tickers_br = parse_manual_list(manual_text)
-    else:
-        uploaded = st.file_uploader("CSV com coluna ticker", type=["csv"])
-        if uploaded is None:
-            st.stop()
-        csv = pd.read_csv(uploaded)
-        col = "ticker" if "ticker" in csv.columns else csv.columns[0]
-        tickers_br = csv[col].astype(str).str.upper().tolist()
+    data = st.session_state.analysis_data
+    prices = data["prices"]
+    ranking = data["ranking"]
+    rs_curves = data["rs_curves"]
+    benchmark = data["benchmark"]
+    windows = data["windows"]
+    failed_tickers = data["failed_tickers"]
+    sector_ranking = data["sector_ranking"]
+    sector_used_tickers = data["sector_used_tickers"]
+    sector_failed_tickers = data["sector_failed_tickers"]
 
-    asset_yahoo = br_to_yahoo(tickers_br)
-    all_asset_tickers = tuple(sorted(set(asset_yahoo + [benchmark.strip()])))
-    prices, used_tickers, failed_tickers = download_prices(all_asset_tickers, start, end)
     if failed_tickers:
         st.warning("Alguns tickers não retornaram dados no Yahoo Finance e foram ignorados: " + ", ".join(failed_tickers))
-    ranking, rs_curves = calc_metrics(prices, benchmark.strip(), windows)
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["Ranking ativos", "Setores", "Linha RS", "Indicador Score", "Mapa de calor"])
 
@@ -394,44 +468,29 @@ try:
             st.plotly_chart(fig, width="stretch")
 
     with tab2:
-        allowed_sector_codes = {"IFNC", "IMAT", "ICON", "UTIL", "IMOB"}
-        sector_tickers = {}
-        for line in sector_text.splitlines():
-            if not line.strip() or "," not in line:
-                continue
-            name, tk = line.split(",", 1)
-            code = name.strip().split(" - ")[0].upper()
-            if code in allowed_sector_codes:
-                sector_tickers[name.strip()] = tk.strip()
-        sector_tickers = {name: ticker for name, ticker in sector_tickers.items() if name.split(" - ")[0].upper() in allowed_sector_codes}
-        sector_all = tuple(sorted(set(list(sector_tickers.values()) + [benchmark.strip()])))
-        sector_prices, sector_used_tickers, sector_failed_tickers = download_prices(sector_all, start, end)
         if sector_used_tickers:
-            used_df = pd.DataFrame([{"Ticker solicitado": k, "Ticker usado": v} for k, v in sector_used_tickers.items() if k != benchmark.strip()])
+            used_df = pd.DataFrame([{"Ticker solicitado": k, "Ticker usado": v} for k, v in sector_used_tickers.items() if k != benchmark])
             if not used_df.empty:
                 st.caption("Tickers efetivamente usados na análise setorial:")
                 st.dataframe(used_df, width="stretch", hide_index=True)
         if sector_failed_tickers:
-            missing = [t for t in sector_failed_tickers if t != benchmark.strip()]
+            missing = [t for t in sector_failed_tickers if t != benchmark]
             if missing:
                 st.warning("Sem dados para: " + ", ".join(missing) + ". Esses índices foram ignorados no ranking setorial.")
-        sector_ranking, sector_rs = calc_metrics(sector_prices, benchmark.strip(), windows)
         if not sector_ranking.empty:
-            inverse = {yahoo_to_br(v): k for k, v in sector_tickers.items()}
-            sector_ranking["Índice"] = sector_ranking["Ativo"].map(inverse).fillna(sector_ranking["Ativo"])
-            cols = ["Índice"] + [c for c in sector_ranking.columns if c not in ["Índice"]]
+            cols = ["Índice"] + [c for c in sector_ranking.columns if c != "Índice"]
             render_table(sector_ranking[cols], "Ranking setorial contra o IBOV")
             fig2 = px.bar(sector_ranking, x="Índice", y="Score", color="Regime", title="Setores/índices com maior força relativa")
             st.plotly_chart(fig2, width="stretch")
         else:
-            st.warning("Não consegui baixar dados suficientes para os índices setoriais informados. Ajuste os tickers na lateral.")
+            st.warning("Não consegui baixar dados suficientes para os índices setoriais informados. Ajuste os tickers na lateral e clique em Atualizar análise.")
 
     with tab3:
         if ranking.empty or rs_curves.empty:
             st.warning("Sem curvas de força relativa.")
         else:
             options = ranking["Ativo"].head(30).tolist()
-            selected = st.multiselect("Ativos para comparar", options, default=options[: min(5, len(options))])
+            selected = st.multiselect("Ativos para comparar", options, default=options[: min(5, len(options))], key="rs_line_assets")
             fig3 = go.Figure()
             for br in selected:
                 ytk = f"{br}.SA"
@@ -444,15 +503,23 @@ try:
         if ranking.empty or prices.empty:
             st.warning("Sem dados para o indicador visual de Score.")
         else:
-            score_options = ranking["Ativo"].head(50).tolist()
-            selected_score_asset = st.selectbox("Ativo para o indicador visual", score_options, index=0)
+            all_available = [yahoo_to_br(c) for c in prices.columns if c != benchmark]
+            ranked_assets = ranking["Ativo"].tolist()
+            score_options = [a for a in ranked_assets if a in all_available]
+            score_options += [a for a in all_available if a not in score_options]
+            selected_score_asset = st.selectbox(
+                "Ativo para o indicador visual",
+                score_options,
+                index=0,
+                key="selected_score_asset",
+            )
             selected_col = f"{selected_score_asset}.SA"
             if selected_col not in prices.columns and selected_score_asset in prices.columns:
                 selected_col = selected_score_asset
             render_score_indicator(
                 prices,
                 selected_col,
-                benchmark.strip(),
+                benchmark,
                 windows,
                 title=f"Indicador visual de Score Relativo — {selected_score_asset} x IBOV",
             )
