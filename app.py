@@ -295,27 +295,37 @@ def render_score_indicator(prices: pd.DataFrame, asset_col: str, benchmark_col: 
     }
     bar_colors = [color_map.get(c, "#B0B0B0") for c in score_df["Condição"]]
 
+    # O histograma usa o Score Elite porque ele é o score final do modelo.
+    # As linhas permitem comparar o Score Simples, sem ajuste de qualidade,
+    # com o Score Elite, ajustado por Sharpe + Sortino.
     fig = go.Figure()
     fig.add_trace(go.Bar(
         x=score_df.index,
-        y=score_df["Score"],
-        name="Histograma Score",
+        y=score_df["Score Elite"],
+        name="Histograma Score Elite",
         marker_color=bar_colors,
-        opacity=0.55,
-        hovertemplate="Data=%{x}<br>Score=%{y:.2f}%<extra></extra>",
+        opacity=0.45,
+        hovertemplate="Data=%{x}<br>Score Elite=%{y:.2f}%<extra></extra>",
     ))
     fig.add_trace(go.Scatter(
         x=score_df.index,
-        y=score_df["Score"],
+        y=score_df["Score Simples"],
         mode="lines",
-        name="Score Relativo",
-        line=dict(width=2.5),
+        name="Score Simples",
+        line=dict(width=2, dash="dash"),
+    ))
+    fig.add_trace(go.Scatter(
+        x=score_df.index,
+        y=score_df["Score Elite"],
+        mode="lines",
+        name="Score Elite (Sharpe + Sortino)",
+        line=dict(width=3),
     ))
     fig.add_trace(go.Scatter(
         x=score_df.index,
         y=score_df["MM20 Score"],
         mode="lines",
-        name="MM20 do Score",
+        name="MM20 do Score Elite",
         line=dict(width=2, dash="dot"),
     ))
     fig.add_hline(y=0, line_width=1, line_dash="dash", annotation_text="Zero", annotation_position="bottom right")
@@ -325,24 +335,30 @@ def render_score_indicator(prices: pd.DataFrame, asset_col: str, benchmark_col: 
         xaxis_title="Data",
         legend_title="Indicador",
         hovermode="x unified",
-        height=560,
+        height=600,
     )
     st.plotly_chart(fig, width="stretch")
 
     last = score_df.iloc[-1]
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Score atual", f"{last['Score']:.2f}%")
-    c2.metric("MM20 Score", f"{last['MM20 Score']:.2f}%" if pd.notna(last["MM20 Score"]) else "n/d")
-    c3.metric(
-        "Distância Score x MM20",
-        f"{(last['Score'] - last['MM20 Score']):.2f} p.p." if pd.notna(last["MM20 Score"]) else "n/d",
-    )
-    c4.metric("Condição", str(last["Condição"]))
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Score Simples", f"{last['Score Simples']:.2f}%" if pd.notna(last["Score Simples"]) else "n/d")
+    c2.metric("Fator Qualidade", f"{last['Qualidade S/S']:.2f}x" if pd.notna(last["Qualidade S/S"]) else "n/d")
+    c3.metric("Score Elite", f"{last['Score Elite']:.2f}%" if pd.notna(last["Score Elite"]) else "n/d")
+    c4.metric("MM20 Elite", f"{last['MM20 Score']:.2f}%" if pd.notna(last["MM20 Score"]) else "n/d")
+    c5.metric("Condição", str(last["Condição"]))
 
-    st.caption(
-        "Leitura: Score acima de zero indica outperform contra o IBOV; "
-        "Score acima da MM20 indica liderança relativa ganhando consistência; "
-        "as barras mostram a direção do score."
+    st.markdown(
+        """
+**Como ler este gráfico:**
+
+- **Score Simples**: força relativa pura do ativo contra o IBOV nas janelas selecionadas.
+- **Score Elite**: Score Simples ponderado pelo **Fator de Qualidade**, calculado com Sharpe 20d e Sortino 20d.
+- **MM20 do Score Elite**: média móvel de 20 pregões do Score Elite; ajuda a identificar consistência ou perda de força.
+- **Histograma**: barras do Score Elite coloridas conforme o sinal e a direção do score.
+
+Quando o **Score Elite** está acima de zero e acima da MM20, o ativo está em liderança relativa com melhor qualidade de retorno.
+Quando o **Score Simples** sobe, mas o **Score Elite** não acompanha, o ativo pode estar subindo com pior relação retorno/risco.
+        """
     )
 
 
@@ -377,6 +393,17 @@ O **Score** é uma média ponderada da performance relativa do ativo contra o IB
 **Performance relativa de cada janela:**
 
 `Relativo Nd % = Retorno do ativo em N pregões - Retorno do IBOV em N pregões`
+
+### Tipos de Score usados no app
+
+| Indicador | Cálculo | Para que serve |
+|---|---|---|
+| **Relativo Nd %** | `Retorno do ativo em N pregões - Retorno do IBOV em N pregões` | Mede se o ativo ganhou ou perdeu do IBOV em cada janela. |
+| **Score Simples** | Média ponderada dos retornos relativos disponíveis | Mede força relativa pura, sem ajuste de risco. |
+| **Sharpe 20d** | Retorno médio excedente / volatilidade total dos retornos | Mede consistência do retorno em relação à volatilidade total. |
+| **Sortino 20d** | Retorno médio excedente / volatilidade negativa | Mede qualidade do retorno penalizando mais as quedas. |
+| **Fator de Qualidade** | `1 + ((0,6 × Sharpe 20d + 0,4 × Sortino 20d) / 2)` limitado entre `0,25x` e `2,00x` | Aumenta ou reduz o Score conforme a qualidade do movimento. |
+| **Score Elite** | `Score Simples × Fator de Qualidade` | Score final do ranking, combinando força relativa com qualidade de retorno. |
 
 **Score simples:**
 
