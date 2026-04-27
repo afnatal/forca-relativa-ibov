@@ -316,15 +316,58 @@ def parse_manual_list(text: str) -> List[str]:
     return [t.strip().upper() for t in tokens if t.strip()]
 
 
-def render_table(df: pd.DataFrame, title: str):
+def render_score_explanation(context: str = "ranking"):
+    """Mostra uma explicação curta e consistente sobre o cálculo do Score."""
+    with st.expander("Como o Score é calculado", expanded=False):
+        st.markdown(
+            """
+O **Score** é uma média ponderada da performance relativa do ativo contra o IBOV.
+
+**Performance relativa de cada janela:**
+
+`Relativo Nd % = Retorno do ativo em N pregões - Retorno do IBOV em N pregões`
+
+**Score final:**
+
+`Score = média ponderada dos retornos relativos disponíveis`
+
+Pesos usados no projeto:
+
+| Janela | Peso |
+|---:|---:|
+| 5 pregões | 20% |
+| 20 pregões | 35% |
+| 60 pregões | 30% |
+| 120 pregões | 15% |
+| 252 pregões | 10% |
+
+Quando nem todas as janelas estão selecionadas ou disponíveis, o app recalibra o Score usando apenas os pesos das janelas calculadas.
+
+**Leitura prática:**
+
+- **Score positivo:** ativo está performando melhor que o IBOV no conjunto das janelas.
+- **Score negativo:** ativo está performando pior que o IBOV.
+- **Score alto e consistente:** possível liderança relativa.
+- **Score caindo ou abaixo da MM20:** perda de força relativa.
+            """
+        )
+        if context == "indicator":
+            st.info(
+                "Na aba Indicador Score, o mesmo cálculo é feito historicamente em cada data, "
+                "permitindo visualizar a evolução do Score, a MM20 do Score e o histograma de força/perda de força."
+            )
+
+
+def render_table(df: pd.DataFrame, title: str, show_score_explanation: bool = False):
     st.subheader(title)
+    if show_score_explanation:
+        render_score_explanation(context="ranking")
     if df.empty:
         st.warning("Sem dados suficientes para montar a tabela.")
         return
     numeric_cols = df.select_dtypes(include=[np.number]).columns
     styled = df.style.format({c: "{:.2f}" for c in numeric_cols})
     st.dataframe(styled, width="stretch", height=520)
-
 
 st.title("Força Relativa B3 x IBOV")
 st.caption("Ranking de ativos e índices setoriais por performance relativa contra o Ibovespa.")
@@ -462,7 +505,7 @@ try:
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["Ranking ativos", "Setores", "Linha RS", "Indicador Score", "Mapa de calor"])
 
     with tab1:
-        render_table(ranking, "Ranking de ativos contra o IBOV")
+        render_table(ranking, "Ranking de ativos contra o IBOV", show_score_explanation=True)
         if not ranking.empty:
             fig = px.bar(ranking.head(top_n), x="Ativo", y="Score", color="Regime", title="Top ativos por Score relativo")
             st.plotly_chart(fig, width="stretch")
@@ -479,7 +522,7 @@ try:
                 st.warning("Sem dados para: " + ", ".join(missing) + ". Esses índices foram ignorados no ranking setorial.")
         if not sector_ranking.empty:
             cols = ["Índice"] + [c for c in sector_ranking.columns if c != "Índice"]
-            render_table(sector_ranking[cols], "Ranking setorial contra o IBOV")
+            render_table(sector_ranking[cols], "Ranking setorial contra o IBOV", show_score_explanation=True)
             fig2 = px.bar(sector_ranking, x="Índice", y="Score", color="Regime", title="Setores/índices com maior força relativa")
             st.plotly_chart(fig2, width="stretch")
         else:
@@ -507,6 +550,7 @@ try:
             ranked_assets = ranking["Ativo"].tolist()
             score_options = [a for a in ranked_assets if a in all_available]
             score_options += [a for a in all_available if a not in score_options]
+            render_score_explanation(context="indicator")
             selected_score_asset = st.selectbox(
                 "Ativo para o indicador visual",
                 score_options,
