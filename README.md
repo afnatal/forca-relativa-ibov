@@ -1,19 +1,45 @@
-# Força Relativa B3 x IBOV
+# Força Relativa B3 x IBOV — Versão ELITE
 
-App Streamlit para ranking de força relativa de ativos da B3 contra o IBOV e análise setorial restrita aos índices:
+App em Streamlit para ranking de força relativa de ativos da B3 contra o Ibovespa.
 
-- IFNC
-- IMAT
-- ICON
-- UTIL
-- IMOB
+## Principais recursos
 
-## Correções desta versão
+- Ranking de ativos contra o IBOV.
+- Análise setorial restrita a IFNC, IMAT, ICON, UTIL e IMOB.
+- Opção de carteira automática do IBOV via B3, lista manual ou upload CSV.
+- Linha de força relativa `Ativo / IBOV`, normalizada em base 100.
+- Indicador visual do Score com linha zero, MM20 e histograma.
+- Mapa de calor das janelas relativas.
+- Score Simples e Score Elite.
 
-- A análise setorial permanece restrita aos cinco índices definidos, com remoção definitiva do IEEX.
-- O app passou a tentar tickers alternativos automaticamente quando o Yahoo Finance não retorna dados para algum índice, quando o Yahoo Finance não retorna dados para algum índice.
-- Um ticker setorial indisponível não interrompe mais a execução: ele é ignorado e exibido em aviso.
-- Substituição de `use_container_width=True` por `width="stretch"` para compatibilidade com versões futuras do Streamlit.
+## Score Simples
+
+O Score Simples é a média ponderada dos retornos relativos contra o IBOV:
+
+`Relativo Nd % = Retorno do ativo em N pregões - Retorno do IBOV em N pregões`
+
+Pesos padrão:
+
+- 5 pregões: 10%
+- 20 pregões: 30%
+- 60 pregões: 30%
+- 120 pregões: 30%
+- 252 pregões: 10%
+
+Quando uma janela não está selecionada ou não possui dados suficientes, o app recalibra usando apenas as janelas disponíveis.
+
+## Score Elite com Sharpe + Sortino
+
+O Score Elite pondera o Score Simples pelo fator de qualidade:
+
+`Score Elite = Score Simples × Fator de Qualidade`
+
+O Fator de Qualidade usa:
+
+- 60% Sharpe 20d
+- 40% Sortino 20d
+
+Ambos são calculados com retornos logarítmicos diários, sem anualizar. O fator é limitado entre 0,25 e 2,00 para evitar distorções por outliers e para não inverter o sinal da força relativa.
 
 ## Como rodar
 
@@ -21,22 +47,3 @@ App Streamlit para ranking de força relativa de ativos da B3 contra o IBOV e an
 pip install -r requirements.txt
 streamlit run app.py
 ```
-
-## Observação
-
-Os dados de preços vêm do Yahoo Finance via `yfinance`. Alguns índices setoriais da B3 podem ficar indisponíveis ou mudar de ticker na base do Yahoo. Por isso o app possui fallback automático e opção de edição manual dos tickers setoriais.
-
-## Atualização: Indicador visual de Score
-
-A aba **Indicador Score** apresenta um painel visual no estilo de indicador técnico:
-
-- Linha do **Score Relativo** contra o IBOV;
-- Linha zero;
-- Média móvel de 20 períodos do Score;
-- Histograma colorido conforme a direção e o sinal do Score:
-  - Score > 0 e subindo: liderança relativa forte;
-  - Score > 0 e caindo: liderança perdendo tração;
-  - Score < 0 e caindo: underperformance aumentando;
-  - Score < 0 e subindo: possível recuperação relativa.
-
-O cálculo é feito pela média ponderada dos retornos relativos selecionados nas janelas do app.

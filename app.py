@@ -142,6 +142,49 @@ def download_prices(tickers: Tuple[str, ...], start: date, end: date) -> Tuple[p
     return close, used_map, failed
 
 
+
+def calc_quality_metrics(asset: pd.Series, rf_daily: float = 0.0, window: int = 20) -> Dict[str, float]:
+    """Calcula Sharpe, Sortino e fator de qualidade para ponderar o Score.
+
+    Usa retornos logarítmicos diários na janela de 20 pregões. Para ranking,
+    não anualiza, pois todos os ativos são comparados no mesmo horizonte.
+    """
+    log_ret = np.log(asset / asset.shift(1)).dropna()
+    recent = log_ret.tail(window)
+    if len(recent) < max(5, window // 2):
+        return {"Sharpe 20d": np.nan, "Sortino 20d": np.nan, "Qualidade S/S": np.nan}
+
+    excess = recent - rf_daily
+    vol = excess.std(ddof=0)
+    downside = excess[excess < 0]
+    down_vol = downside.std(ddof=0) if len(downside) >= 2 else np.nan
+
+    sharpe = excess.mean() / vol if pd.notna(vol) and vol > 0 else np.nan
+    sortino = excess.mean() / down_vol if pd.notna(down_vol) and down_vol > 0 else np.nan
+    if pd.isna(sortino) and pd.notna(sharpe):
+        sortino = sharpe
+
+    quality_raw = 0.6 * sharpe + 0.4 * sortino if pd.notna(sharpe) and pd.notna(sortino) else np.nan
+    quality_factor = np.clip(1 + (quality_raw / 2), 0.25, 2.00) if pd.notna(quality_raw) else np.nan
+    return {"Sharpe 20d": sharpe, "Sortino 20d": sortino, "Qualidade S/S": quality_factor}
+
+
+def rolling_quality_factor(asset: pd.Series, rf_daily: float = 0.0, window: int = 20) -> pd.Series:
+    """Série histórica do fator de qualidade baseado em Sharpe + Sortino."""
+    log_ret = np.log(asset / asset.shift(1))
+    excess = log_ret - rf_daily
+    mean = excess.rolling(window).mean()
+    vol = excess.rolling(window).std(ddof=0)
+    sharpe = mean / vol.replace(0, np.nan)
+
+    downside = excess.where(excess < 0)
+    down_vol = downside.rolling(window, min_periods=max(5, window // 2)).std(ddof=0)
+    sortino = mean / down_vol.replace(0, np.nan)
+    sortino = sortino.fillna(sharpe)
+
+    quality_raw = 0.6 * sharpe + 0.4 * sortino
+    quality_factor = (1 + quality_raw / 2).clip(lower=0.25, upper=2.00)
+    return quality_factor
 def calc_metrics(prices: pd.DataFrame, benchmark: str, windows: List[int], ma_window: int = 20) -> Tuple[pd.DataFrame, pd.DataFrame]:
     prices = prices.dropna(how="all").ffill()
     if benchmark not in prices.columns:
@@ -162,7 +205,7 @@ def calc_metrics(prices: pd.DataFrame, benchmark: str, windows: List[int], ma_wi
         rs_curves[tk] = rs_norm.reindex(prices.index)
         row = {"Ativo": yahoo_to_br(tk)}
         score = 0.0
-        weights = {5: 0.20, 20: 0.35, 60: 0.30, 120: 0.15, 252: 0.10}
+        weights = {5: 0.10, 20: 0.30, 60: 0.30, 120: 0.30, 252: 0.10}
         used_weight = 0.0
         for w in windows:
             if len(asset) > w:
@@ -178,10 +221,14 @@ def calc_metrics(prices: pd.DataFrame, benchmark: str, windows: List[int], ma_wi
         rs_ma = rs.rolling(ma_window).mean()
         row["RS Atual"] = rs_norm.iloc[-1]
         row["RS x MM20 %"] = ((rs.iloc[-1] / rs_ma.iloc[-1] - 1) * 100) if len(rs_ma.dropna()) else np.nan
-        row["Score"] = (score / used_weight * 100) if used_weight else np.nan
+        row["Score Simples"] = (score / used_weight * 100) if used_weight else np.nan
+        q = calc_quality_metrics(asset, rf_daily=0.0, window=20)
+        row.update(q)
+        row["Score Elite"] = row["Score Simples"] * row["Qualidade S/S"] if pd.notna(row["Score Simples"]) and pd.notna(row["Qualidade S/S"]) else np.nan
+        row["Score"] = row["Score Elite"]
         row["Regime"] = classify_regime(row)
         rows.append(row)
-    ranking = pd.DataFrame(rows).sort_values("Score", ascending=False) if rows else pd.DataFrame()
+    ranking = pd.DataFrame(rows).sort_values("Score Elite", ascending=False) if rows else pd.DataFrame()
     return ranking, rs_curves
 
 
@@ -195,7 +242,7 @@ def calc_score_series(prices: pd.DataFrame, asset_col: str, benchmark_col: str, 
 
     asset = aligned[asset_col]
     bench = aligned[benchmark_col]
-    weights = {5: 0.20, 20: 0.35, 60: 0.30, 120: 0.15, 252: 0.10}
+    weights = {5: 0.10, 20: 0.30, 60: 0.30, 120: 0.30, 252: 0.10}
     score = pd.Series(0.0, index=aligned.index)
     total_weight = pd.Series(0.0, index=aligned.index)
 
@@ -208,8 +255,12 @@ def calc_score_series(prices: pd.DataFrame, asset_col: str, benchmark_col: str, 
         total_weight = total_weight.add(rel.notna().astype(float) * wt, fill_value=0)
 
     score_pct = (score / total_weight.replace(0, np.nan)) * 100
+    quality_factor = rolling_quality_factor(asset, rf_daily=0.0, window=20)
     df = pd.DataFrame(index=aligned.index)
-    df["Score"] = score_pct
+    df["Score Simples"] = score_pct
+    df["Qualidade S/S"] = quality_factor
+    df["Score Elite"] = df["Score Simples"] * df["Qualidade S/S"]
+    df["Score"] = df["Score Elite"]
     df["MM20 Score"] = df["Score"].rolling(ma_window).mean()
     df["Histograma"] = df["Score"] - df["MM20 Score"]
     df["Direção"] = df["Score"].diff()
@@ -327,25 +378,34 @@ O **Score** é uma média ponderada da performance relativa do ativo contra o IB
 
 `Relativo Nd % = Retorno do ativo em N pregões - Retorno do IBOV em N pregões`
 
-**Score final:**
+**Score simples:**
 
-`Score = média ponderada dos retornos relativos disponíveis`
+`Score Simples = média ponderada dos retornos relativos disponíveis`
+
+**Score ELITE:**
+
+`Score Elite = Score Simples × Fator de Qualidade`
+
+**Fator de Qualidade:** calculado com 60% de Sharpe 20d e 40% de Sortino 20d. O fator é limitado entre 0,25 e 2,00 para evitar distorções por outliers.
 
 Pesos usados no projeto:
 
 | Janela | Peso |
 |---:|---:|
-| 5 pregões | 20% |
-| 20 pregões | 35% |
+| 5 pregões | 10% |
+| 20 pregões | 30% |
 | 60 pregões | 30% |
-| 120 pregões | 15% |
+| 120 pregões | 30% |
 | 252 pregões | 10% |
 
 Quando nem todas as janelas estão selecionadas ou disponíveis, o app recalibra o Score usando apenas os pesos das janelas calculadas.
 
 **Leitura prática:**
 
-- **Score positivo:** ativo está performando melhor que o IBOV no conjunto das janelas.
+- **Score Simples positivo:** ativo está performando melhor que o IBOV no conjunto das janelas.
+- **Score Elite:** mantém a força relativa, mas dá mais peso aos ativos com melhor relação retorno/risco.
+- **Sharpe 20d:** mede retorno médio por volatilidade total.
+- **Sortino 20d:** mede retorno médio por volatilidade negativa (quedas).
 - **Score negativo:** ativo está performando pior que o IBOV.
 - **Score alto e consistente:** possível liderança relativa.
 - **Score caindo ou abaixo da MM20:** perda de força relativa.
