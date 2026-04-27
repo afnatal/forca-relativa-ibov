@@ -358,10 +358,44 @@ Quando nem todas as janelas estão selecionadas ou disponíveis, o app recalibra
             )
 
 
-def render_table(df: pd.DataFrame, title: str, show_score_explanation: bool = False):
+def render_regime_explanation():
+    """Mostra os critérios usados para definir o regime de força relativa."""
+    with st.expander("Critérios para definição do Regime", expanded=False):
+        st.markdown(
+            """
+O **Regime** resume a condição de força relativa do ativo/índice contra o IBOV.
+
+O app usa principalmente três informações:
+
+1. **Relativo 20d %**: retorno do ativo em 20 pregões menos o retorno do IBOV no mesmo período.
+2. **Relativo 60d %**: retorno do ativo em 60 pregões menos o retorno do IBOV no mesmo período.
+3. **RS x MM20 %**: distância da linha de força relativa `Ativo / IBOV` em relação à sua média móvel de 20 períodos.
+
+### Opções de regime
+
+| Regime | Critério usado | Interpretação prática |
+|---|---|---|
+| **Liderança relativa** | Relativo 20d > 0, Relativo 60d > 0 e RS acima da MM20 | Força relativa sustentada contra o IBOV. |
+| **Virando para cima** | Relativo 20d > 0, Relativo 60d < 0 e RS acima da MM20 | Possível início de rotação positiva. |
+| **Perdendo força** | Relativo 20d < 0 e Relativo 60d > 0 | Ainda tem desempenho médio positivo, mas perdeu tração recente. |
+| **Underperform** | Relativo 20d < 0, Relativo 60d < 0 e RS abaixo da MM20 | Pior desempenho relativo e sem recuperação confirmada. |
+| **Neutro** | Critérios mistos ou dados insuficientes | Exige leitura complementar pelo gráfico, preço, volume e fluxo. |
+
+### Como usar
+
+- Para compras, priorize **Liderança relativa** ou **Virando para cima**, desde que o gráfico de preço confirme.
+- Para alerta de realização ou perda de tração, observe **Perdendo força**.
+- Para evitar compras direcionais, filtre ativos em **Underperform**.
+            """
+        )
+
+
+def render_table(df: pd.DataFrame, title: str, show_score_explanation: bool = False, show_regime_explanation: bool = False):
     st.subheader(title)
     if show_score_explanation:
         render_score_explanation(context="ranking")
+    if show_regime_explanation:
+        render_regime_explanation()
     if df.empty:
         st.warning("Sem dados suficientes para montar a tabela.")
         return
@@ -505,7 +539,7 @@ try:
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["Ranking ativos", "Setores", "Linha RS", "Indicador Score", "Mapa de calor"])
 
     with tab1:
-        render_table(ranking, "Ranking de ativos contra o IBOV", show_score_explanation=True)
+        render_table(ranking, "Ranking de ativos contra o IBOV", show_score_explanation=True, show_regime_explanation=True)
         if not ranking.empty:
             fig = px.bar(ranking.head(top_n), x="Ativo", y="Score", color="Regime", title="Top ativos por Score relativo")
             st.plotly_chart(fig, width="stretch")
@@ -522,7 +556,7 @@ try:
                 st.warning("Sem dados para: " + ", ".join(missing) + ". Esses índices foram ignorados no ranking setorial.")
         if not sector_ranking.empty:
             cols = ["Índice"] + [c for c in sector_ranking.columns if c != "Índice"]
-            render_table(sector_ranking[cols], "Ranking setorial contra o IBOV", show_score_explanation=True)
+            render_table(sector_ranking[cols], "Ranking setorial contra o IBOV", show_score_explanation=True, show_regime_explanation=True)
             fig2 = px.bar(sector_ranking, x="Índice", y="Score", color="Regime", title="Setores/índices com maior força relativa")
             st.plotly_chart(fig2, width="stretch")
         else:
@@ -551,6 +585,7 @@ try:
             score_options = [a for a in ranked_assets if a in all_available]
             score_options += [a for a in all_available if a not in score_options]
             render_score_explanation(context="indicator")
+            render_regime_explanation()
             selected_score_asset = st.selectbox(
                 "Ativo para o indicador visual",
                 score_options,
