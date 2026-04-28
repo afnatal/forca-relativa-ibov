@@ -378,6 +378,30 @@ def classify_regime(row: Dict) -> str:
     return "Neutro"
 
 
+
+REGIME_COLOR_MAP = {
+    "Perdendo força": "#F28E2B",      # laranja
+    "Virando para cima": "#8CD17D",   # verde claro
+    "Liderança relativa": "#006400",  # verde escuro
+    "Underperform": "#D62728",        # vermelho
+    "Neutro": "#F1C40F",              # amarelo
+}
+
+
+def reorder_ranking_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Coloca Regime como segunda coluna, logo após Ativo/Ticker/Índice, mantendo as demais colunas."""
+    if df.empty or "Regime" not in df.columns:
+        return df
+    first_col = None
+    for candidate in ["Ativo", "Ticker", "Índice"]:
+        if candidate in df.columns:
+            first_col = candidate
+            break
+    if first_col is None:
+        return df
+    ordered = [first_col, "Regime"] + [c for c in df.columns if c not in [first_col, "Regime"]]
+    return df[ordered]
+
 def parse_manual_list(text: str) -> List[str]:
     tokens = text.replace(";", ",").replace("\n", ",").split(",")
     return [t.strip().upper() for t in tokens if t.strip()]
@@ -486,6 +510,7 @@ def render_table(df: pd.DataFrame, title: str, show_score_explanation: bool = Fa
     if df.empty:
         st.warning("Sem dados suficientes para montar a tabela.")
         return
+    df = reorder_ranking_columns(df)
     numeric_cols = df.select_dtypes(include=[np.number]).columns
     styled = df.style.format({c: "{:.2f}" for c in numeric_cols})
     st.dataframe(styled, width="stretch", height=520)
@@ -628,7 +653,14 @@ try:
     with tab1:
         render_table(ranking, "Ranking de ativos contra o IBOV", show_score_explanation=True, show_regime_explanation=True)
         if not ranking.empty:
-            fig = px.bar(ranking.head(top_n), x="Ativo", y="Score", color="Regime", title="Top ativos por Score relativo")
+            fig = px.bar(
+                ranking.head(top_n),
+                x="Ativo",
+                y="Score",
+                color="Regime",
+                color_discrete_map=REGIME_COLOR_MAP,
+                title="Top ativos por Score relativo",
+            )
             st.plotly_chart(fig, width="stretch")
 
     with tab2:
@@ -644,7 +676,14 @@ try:
         if not sector_ranking.empty:
             cols = ["Índice"] + [c for c in sector_ranking.columns if c != "Índice"]
             render_table(sector_ranking[cols], "Ranking setorial contra o IBOV", show_score_explanation=True, show_regime_explanation=True)
-            fig2 = px.bar(sector_ranking, x="Índice", y="Score", color="Regime", title="Setores/índices com maior força relativa")
+            fig2 = px.bar(
+                sector_ranking,
+                x="Índice",
+                y="Score",
+                color="Regime",
+                color_discrete_map=REGIME_COLOR_MAP,
+                title="Setores/índices com maior força relativa",
+            )
             st.plotly_chart(fig2, width="stretch")
         else:
             st.warning("Não consegui baixar dados suficientes para os índices setoriais informados. Ajuste os tickers na lateral e clique em Atualizar análise.")

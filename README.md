@@ -47,3 +47,21 @@ Ambos são calculados com retornos logarítmicos diários, sem anualizar. O fato
 pip install -r requirements.txt
 streamlit run app.py
 ```
+
+
+## Atualização desta versão
+
+A aba **Indicador Score** agora plota duas linhas:
+
+- **Score Simples**: força relativa pura contra o IBOV.
+- **Score Elite**: Score Simples ponderado pelo fator de qualidade Sharpe + Sortino.
+
+Também foram adicionados comentários na interface explicando:
+
+- Relativo por janela;
+- Score Simples;
+- Sharpe 20d;
+- Sortino 20d;
+- Fator de Qualidade;
+- Score Elite;
+- interpretação prática do gráfico.
