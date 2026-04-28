@@ -32,6 +32,14 @@ YAHOO_TICKER_ALIASES = {
     "UTIL.SA": ["UTIL.SA", "^UTIL", "UTIL"],
     "IMOB.SA": ["IMOB.SA", "^IMOB", "IMOB"],
     "^BVSP": ["^BVSP", "IBOV.SA"],
+    "^SPX": ["^SPX", "^GSPC"],
+    "^IXIC": ["^IXIC"],
+}
+
+BENCHMARK_OPTIONS = {
+    "IBOV": "^BVSP",
+    "SPX": "^SPX",
+    "NASDAQ": "^IXIC",
 }
 
 FALLBACK_IBOV = [
@@ -521,7 +529,23 @@ st.caption("Ranking de ativos e índices setoriais por performance relativa cont
 with st.sidebar:
     st.header("Configuração")
     source_mode = st.radio("Universo de ativos", ["Carteira IBOV automática B3", "Lista manual", "Upload CSV"], index=0)
-    benchmark_input = st.text_input("Benchmark", value="^BVSP", help="Yahoo Finance: ^BVSP para Ibovespa.")
+
+    st.subheader("Benchmark")
+    benchmark_choice = st.selectbox(
+        "Benchmark padrão",
+        list(BENCHMARK_OPTIONS.keys()),
+        index=0,
+        help="Selecione um benchmark padrão. O app usará automaticamente o ticker correspondente no Yahoo Finance.",
+    )
+    custom_benchmark = st.text_input(
+        "Benchmark personalizado opcional",
+        value="",
+        placeholder="Ex.: ^RUT, SPY, EWZ, BOVA11.SA",
+        help="Preencha somente se quiser substituir o benchmark padrão selecionado acima.",
+    )
+    benchmark_input = custom_benchmark.strip() or BENCHMARK_OPTIONS[benchmark_choice]
+    st.caption(f"Benchmark em uso: **{benchmark_choice if not custom_benchmark.strip() else 'Personalizado'}** → `{benchmark_input}`")
+
     start = st.date_input("Data inicial", value=date.today() - timedelta(days=370))
     end = st.date_input("Data final", value=date.today())
     windows_input = st.multiselect("Janelas de ranking", [5, 20, 60, 120, 252], default=[5, 20, 60, 120])
@@ -590,6 +614,7 @@ if "analysis_ready" not in st.session_state:
 if run:
     try:
         benchmark = benchmark_input.strip()
+        benchmark_label = benchmark_choice if not custom_benchmark.strip() else f"Personalizado ({benchmark})"
         windows = windows_input
         tickers_br = resolve_tickers(source_mode, manual_text, uploaded)
         if not tickers_br:
@@ -613,6 +638,7 @@ if run:
             "ranking": ranking,
             "rs_curves": rs_curves,
             "benchmark": benchmark,
+            "benchmark_label": benchmark_label,
             "windows": windows,
             "failed_tickers": failed_tickers,
             "sector_prices": sector_prices,
@@ -639,6 +665,7 @@ try:
     ranking = data["ranking"]
     rs_curves = data["rs_curves"]
     benchmark = data["benchmark"]
+    benchmark_label = data.get("benchmark_label", benchmark)
     windows = data["windows"]
     failed_tickers = data["failed_tickers"]
     sector_ranking = data["sector_ranking"]
@@ -651,7 +678,7 @@ try:
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["Ranking ativos", "Setores", "Linha RS", "Indicador Score", "Mapa de calor"])
 
     with tab1:
-        render_table(ranking, "Ranking de ativos contra o IBOV", show_score_explanation=True, show_regime_explanation=True)
+        render_table(ranking, f"Ranking de ativos contra {benchmark_label}", show_score_explanation=True, show_regime_explanation=True)
         if not ranking.empty:
             fig = px.bar(
                 ranking.head(top_n),
@@ -659,7 +686,7 @@ try:
                 y="Score",
                 color="Regime",
                 color_discrete_map=REGIME_COLOR_MAP,
-                title="Top ativos por Score relativo",
+                title=f"Top ativos por Score relativo contra {benchmark_label}",
             )
             st.plotly_chart(fig, width="stretch")
 
@@ -675,7 +702,7 @@ try:
                 st.warning("Sem dados para: " + ", ".join(missing) + ". Esses índices foram ignorados no ranking setorial.")
         if not sector_ranking.empty:
             cols = ["Índice"] + [c for c in sector_ranking.columns if c != "Índice"]
-            render_table(sector_ranking[cols], "Ranking setorial contra o IBOV", show_score_explanation=True, show_regime_explanation=True)
+            render_table(sector_ranking[cols], f"Ranking setorial contra {benchmark_label}", show_score_explanation=True, show_regime_explanation=True)
             fig2 = px.bar(
                 sector_ranking,
                 x="Índice",
@@ -699,7 +726,7 @@ try:
                 ytk = f"{br}.SA"
                 if ytk in rs_curves.columns:
                     fig3.add_trace(go.Scatter(x=rs_curves.index, y=rs_curves[ytk], mode="lines", name=br))
-            fig3.update_layout(title="Linha de Força Relativa normalizada — Ativo / IBOV, base 100", yaxis_title="RS base 100")
+            fig3.update_layout(title=f"Linha de Força Relativa normalizada — Ativo / {benchmark_label}, base 100", yaxis_title="RS base 100")
             st.plotly_chart(fig3, width="stretch")
 
     with tab4:
@@ -726,7 +753,7 @@ try:
                 selected_col,
                 benchmark,
                 windows,
-                title=f"Indicador visual de Score Relativo — {selected_score_asset} x IBOV",
+                title=f"Indicador visual de Score Relativo — {selected_score_asset} x {benchmark_label}",
             )
 
     with tab5:
@@ -735,7 +762,7 @@ try:
         else:
             rel_cols = [c for c in ranking.columns if c.startswith("Relativo")]
             heat = ranking.set_index("Ativo")[rel_cols].head(50)
-            fig4 = px.imshow(heat, aspect="auto", text_auto=".1f", title="Mapa de calor: retorno relativo contra IBOV (%)")
+            fig4 = px.imshow(heat, aspect="auto", text_auto=".1f", title=f"Mapa de calor: retorno relativo contra {benchmark_label} (%)")
             st.plotly_chart(fig4, width="stretch")
 
     st.download_button(

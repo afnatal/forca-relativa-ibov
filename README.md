@@ -65,3 +65,13 @@ Também foram adicionados comentários na interface explicando:
 - Fator de Qualidade;
 - Score Elite;
 - interpretação prática do gráfico.
+
+## Benchmark
+
+O app agora possui uma seleção fixa de benchmark com nomes amigáveis:
+
+- IBOV → `^BVSP`
+- SPX → `^SPX`
+- NASDAQ → `^IXIC`
+
+Também existe um campo opcional para benchmark personalizado. Quando preenchido, ele substitui a opção fixa selecionada.
