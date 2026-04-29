@@ -617,7 +617,7 @@ with st.sidebar:
     end = st.date_input("Data final", value=date.today())
     windows_input = st.multiselect("Janelas de ranking", [5, 20, 60, 120, 252], default=[5, 20, 60, 120])
     top_n = st.slider("Quantidade no gráfico", min_value=5, max_value=40, value=15)
-    manual_text = st.text_area("Lista manual de ativos", value="PETR4, VALE3, ITUB4, BBAS3, BBDC4, BPAC11, PRIO3")
+    manual_text = st.text_area("Lista manual de ativos", value="PETR4, VALE3, ITUB4, BBAS3, BBDC4, BPAC11, AXIA3, PRIO3, WEGE3, SBSP3")
 
     uploaded = None
     if source_mode == "Upload CSV":
