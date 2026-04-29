@@ -34,13 +34,17 @@ YAHOO_TICKER_ALIASES = {
     "^BVSP": ["^BVSP", "IBOV.SA"],
     "^SPX": ["^SPX", "^GSPC"],
     "^IXIC": ["^IXIC"],
+    "DX-Y.NYB": ["DX-Y.NYB", "^DXY"],
 }
 
 BENCHMARK_OPTIONS = {
     "IBOV": "^BVSP",
     "SPX": "^SPX",
     "NASDAQ": "^IXIC",
+    "DXY (Dollar Index)": "DX-Y.NYB",
 }
+
+MULTI_BENCHMARK_OPTIONS = BENCHMARK_OPTIONS.copy()
 
 FALLBACK_IBOV = [
     "ABEV3", "ASAI3", "AURE3", "AZUL4", "B3SA3", "BBAS3", "BBDC3", "BBDC4",
@@ -221,7 +225,7 @@ def calc_metrics(prices: pd.DataFrame, benchmark: str, windows: List[int], ma_wi
                 ret_bench = bm.iloc[-1] / bm.iloc[-w - 1] - 1
                 rel = ret_asset - ret_bench
                 row[f"Ativo {w}d %"] = ret_asset * 100
-                row[f"IBOV {w}d %"] = ret_bench * 100
+                row[f"Benchmark {w}d %"] = ret_bench * 100
                 row[f"Relativo {w}d %"] = rel * 100
                 wt = weights.get(w, 1 / len(windows))
                 score += rel * wt
@@ -420,17 +424,17 @@ def render_score_explanation(context: str = "ranking"):
     with st.expander("Como o Score é calculado", expanded=False):
         st.markdown(
             """
-O **Score** é uma média ponderada da performance relativa do ativo contra o IBOV.
+O **Score** é uma média ponderada da performance relativa do ativo contra o benchmark selecionado.
 
 **Performance relativa de cada janela:**
 
-`Relativo Nd % = Retorno do ativo em N pregões - Retorno do IBOV em N pregões`
+`Relativo Nd % = Retorno do ativo em N pregões - Retorno do benchmark em N pregões`
 
 ### Tipos de Score usados no app
 
 | Indicador | Cálculo | Para que serve |
 |---|---|---|
-| **Relativo Nd %** | `Retorno do ativo em N pregões - Retorno do IBOV em N pregões` | Mede se o ativo ganhou ou perdeu do IBOV em cada janela. |
+| **Relativo Nd %** | `Retorno do ativo em N pregões - Retorno do benchmark em N pregões` | Mede se o ativo ganhou ou perdeu do IBOV em cada janela. |
 | **Score Simples** | Média ponderada dos retornos relativos disponíveis | Mede força relativa pura, sem ajuste de risco. |
 | **Sharpe 20d** | Retorno médio excedente / volatilidade total dos retornos | Mede consistência do retorno em relação à volatilidade total. |
 | **Sortino 20d** | Retorno médio excedente / volatilidade negativa | Mede qualidade do retorno penalizando mais as quedas. |
@@ -461,11 +465,11 @@ Quando nem todas as janelas estão selecionadas ou disponíveis, o app recalibra
 
 **Leitura prática:**
 
-- **Score Simples positivo:** ativo está performando melhor que o IBOV no conjunto das janelas.
+- **Score Simples positivo:** ativo está performando melhor que o benchmark no conjunto das janelas.
 - **Score Elite:** mantém a força relativa, mas dá mais peso aos ativos com melhor relação retorno/risco.
 - **Sharpe 20d:** mede retorno médio por volatilidade total.
 - **Sortino 20d:** mede retorno médio por volatilidade negativa (quedas).
-- **Score negativo:** ativo está performando pior que o IBOV.
+- **Score negativo:** ativo está performando pior que o benchmark.
 - **Score alto e consistente:** possível liderança relativa.
 - **Score caindo ou abaixo da MM20:** perda de força relativa.
             """
@@ -482,12 +486,12 @@ def render_regime_explanation():
     with st.expander("Critérios para definição do Regime", expanded=False):
         st.markdown(
             """
-O **Regime** resume a condição de força relativa do ativo/índice contra o IBOV.
+O **Regime** resume a condição de força relativa do ativo/índice contra o benchmark selecionado.
 
 O app usa principalmente três informações:
 
-1. **Relativo 20d %**: retorno do ativo em 20 pregões menos o retorno do IBOV no mesmo período.
-2. **Relativo 60d %**: retorno do ativo em 60 pregões menos o retorno do IBOV no mesmo período.
+1. **Relativo 20d %**: retorno do ativo em 20 pregões menos o retorno do benchmark no mesmo período.
+2. **Relativo 60d %**: retorno do ativo em 60 pregões menos o retorno do benchmark no mesmo período.
 3. **RS x MM20 %**: distância da linha de força relativa `Ativo / IBOV` em relação à sua média móvel de 20 períodos.
 
 ### Opções de regime
@@ -509,6 +513,69 @@ O app usa principalmente três informações:
         )
 
 
+def build_multi_benchmark_summary(asset_prices: pd.DataFrame, benchmark_prices: pd.DataFrame, windows: List[int]) -> pd.DataFrame:
+    """Cria resumo multi-benchmark usando o mesmo cálculo de Score Elite para cada benchmark fixo."""
+    rows = []
+    if asset_prices.empty or benchmark_prices.empty:
+        return pd.DataFrame()
+
+    for label, bench_ticker in MULTI_BENCHMARK_OPTIONS.items():
+        if bench_ticker not in benchmark_prices.columns:
+            continue
+        combined = pd.concat([asset_prices, benchmark_prices[[bench_ticker]]], axis=1).dropna(how="all").ffill()
+        try:
+            rank, _ = calc_metrics(combined, bench_ticker, windows)
+        except Exception:
+            continue
+        if rank.empty:
+            continue
+        for _, row in rank.iterrows():
+            rows.append({
+                "Ativo": row.get("Ativo"),
+                "Benchmark": label,
+                "Ticker Benchmark": bench_ticker,
+                "Regime": row.get("Regime"),
+                "Score Elite": row.get("Score Elite"),
+                "Score Simples": row.get("Score Simples"),
+                "Sharpe 20d": row.get("Sharpe 20d"),
+                "Sortino 20d": row.get("Sortino 20d"),
+                "Relativo 20d %": row.get("Relativo 20d %"),
+                "Relativo 60d %": row.get("Relativo 60d %"),
+                "RS x MM20 %": row.get("RS x MM20 %"),
+            })
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+
+    pivot = out.pivot_table(index="Ativo", columns="Benchmark", values="Score Elite", aggfunc="first")
+    summary = pivot.reset_index()
+    bench_cols = [c for c in MULTI_BENCHMARK_OPTIONS.keys() if c in summary.columns]
+    summary["Score Multi-Benchmark"] = summary[bench_cols].mean(axis=1, skipna=True)
+    summary["Benchmarks positivos"] = (summary[bench_cols] > 0).sum(axis=1)
+    summary["Total benchmarks"] = summary[bench_cols].notna().sum(axis=1)
+    summary["Consistência"] = summary["Benchmarks positivos"].astype(str) + "/" + summary["Total benchmarks"].astype(str)
+
+    def classify_multi(row):
+        score = row.get("Score Multi-Benchmark", np.nan)
+        positives = row.get("Benchmarks positivos", 0)
+        total = row.get("Total benchmarks", 0)
+        if pd.isna(score) or total == 0:
+            return "Neutro"
+        if score > 0 and positives >= max(3, total - 1):
+            return "Liderança relativa"
+        if score > 0 and positives >= 2:
+            return "Virando para cima"
+        if score < 0 and positives <= 1:
+            return "Underperform"
+        if score < 0 and positives >= 2:
+            return "Perdendo força"
+        return "Neutro"
+
+    summary["Regime"] = summary.apply(classify_multi, axis=1)
+    ordered = ["Ativo", "Regime", "Score Multi-Benchmark", "Consistência"] + bench_cols
+    return summary[ordered].sort_values("Score Multi-Benchmark", ascending=False)
+
+
 def render_table(df: pd.DataFrame, title: str, show_score_explanation: bool = False, show_regime_explanation: bool = False):
     st.subheader(title)
     if show_score_explanation:
@@ -523,8 +590,8 @@ def render_table(df: pd.DataFrame, title: str, show_score_explanation: bool = Fa
     styled = df.style.format({c: "{:.2f}" for c in numeric_cols})
     st.dataframe(styled, width="stretch", height=520)
 
-st.title("Força Relativa B3 x IBOV")
-st.caption("Ranking de ativos e índices setoriais por performance relativa contra o Ibovespa.")
+st.title("Força Relativa B3 x Benchmarks")
+st.caption("Ranking de ativos e índices setoriais por performance relativa contra IBOV, SPX, NASDAQ, DXY ou benchmark personalizado.")
 
 with st.sidebar:
     st.header("Configuração")
@@ -625,6 +692,11 @@ if run:
         prices, used_tickers, failed_tickers = download_prices(all_asset_tickers, start, end)
         ranking, rs_curves = calc_metrics(prices, benchmark, windows)
 
+        fixed_benchmark_tickers = tuple(sorted(set(MULTI_BENCHMARK_OPTIONS.values())))
+        multi_benchmark_prices, multi_benchmark_used, multi_benchmark_failed = download_prices(fixed_benchmark_tickers, start, end)
+        asset_only_prices = prices[[c for c in prices.columns if c in asset_yahoo]].copy() if not prices.empty else pd.DataFrame()
+        multi_benchmark_summary = build_multi_benchmark_summary(asset_only_prices, multi_benchmark_prices, windows)
+
         sector_tickers = parse_sector_tickers(sector_text)
         sector_all = tuple(sorted(set(list(sector_tickers.values()) + [benchmark])))
         sector_prices, sector_used_tickers, sector_failed_tickers = download_prices(sector_all, start, end)
@@ -647,6 +719,10 @@ if run:
             "sector_used_tickers": sector_used_tickers,
             "sector_failed_tickers": sector_failed_tickers,
             "sector_tickers": sector_tickers,
+            "multi_benchmark_prices": multi_benchmark_prices,
+            "multi_benchmark_used": multi_benchmark_used,
+            "multi_benchmark_failed": multi_benchmark_failed,
+            "multi_benchmark_summary": multi_benchmark_summary,
         }
         st.session_state.analysis_ready = True
         st.success("Dados atualizados e armazenados na sessão. Agora você pode trocar o ativo no indicador sem recalcular.")
@@ -671,11 +747,13 @@ try:
     sector_ranking = data["sector_ranking"]
     sector_used_tickers = data["sector_used_tickers"]
     sector_failed_tickers = data["sector_failed_tickers"]
+    multi_benchmark_summary = data.get("multi_benchmark_summary", pd.DataFrame())
+    multi_benchmark_failed = data.get("multi_benchmark_failed", [])
 
     if failed_tickers:
         st.warning("Alguns tickers não retornaram dados no Yahoo Finance e foram ignorados: " + ", ".join(failed_tickers))
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Ranking ativos", "Setores", "Linha RS", "Indicador Score", "Mapa de calor"])
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Ranking ativos", "Setores", "Linha RS", "Indicador Score", "Mapa de calor", "Multi-benchmark"])
 
     with tab1:
         render_table(ranking, f"Ranking de ativos contra {benchmark_label}", show_score_explanation=True, show_regime_explanation=True)
@@ -764,6 +842,45 @@ try:
             heat = ranking.set_index("Ativo")[rel_cols].head(50)
             fig4 = px.imshow(heat, aspect="auto", text_auto=".1f", title=f"Mapa de calor: retorno relativo contra {benchmark_label} (%)")
             st.plotly_chart(fig4, width="stretch")
+
+
+    with tab6:
+        st.subheader("Radar multi-benchmark")
+        st.markdown(
+            """
+Este painel compara os mesmos ativos simultaneamente contra os benchmarks fixos: **IBOV**, **SPX**, **NASDAQ** e **DXY**.
+
+A coluna **Score Multi-Benchmark** é a média dos Scores Elite disponíveis contra cada benchmark.
+A coluna **Consistência** mostra em quantos benchmarks o ativo está com Score Elite positivo.
+            """
+        )
+        if multi_benchmark_failed:
+            st.warning("Alguns benchmarks fixos não retornaram dados e foram ignorados: " + ", ".join(multi_benchmark_failed))
+        if multi_benchmark_summary.empty:
+            st.warning("Sem dados suficientes para montar o radar multi-benchmark.")
+        else:
+            render_table(multi_benchmark_summary, "Ranking multi-benchmark", show_score_explanation=False, show_regime_explanation=True)
+            mb_top = multi_benchmark_summary.head(top_n)
+            fig_mb = px.bar(
+                mb_top,
+                x="Ativo",
+                y="Score Multi-Benchmark",
+                color="Regime",
+                color_discrete_map=REGIME_COLOR_MAP,
+                title="Top ativos por Score Multi-Benchmark",
+            )
+            st.plotly_chart(fig_mb, width="stretch")
+
+            heat_cols = [c for c in MULTI_BENCHMARK_OPTIONS.keys() if c in multi_benchmark_summary.columns]
+            if heat_cols:
+                heat_mb = multi_benchmark_summary.set_index("Ativo")[heat_cols].head(50)
+                fig_mb_heat = px.imshow(
+                    heat_mb,
+                    aspect="auto",
+                    text_auto=".1f",
+                    title="Mapa de calor multi-benchmark — Score Elite por benchmark",
+                )
+                st.plotly_chart(fig_mb_heat, width="stretch")
 
     st.download_button(
         "Baixar ranking em CSV",
