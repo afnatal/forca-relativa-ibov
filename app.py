@@ -46,6 +46,8 @@ BENCHMARK_OPTIONS = {
 
 MULTI_BENCHMARK_OPTIONS = BENCHMARK_OPTIONS.copy()
 
+DEFAULT_MANUAL_ASSETS = "PETR4, VALE3, ITUB4, BBAS3, BBDC4, BPAC11, AXIA3, PRIO3, WEGE3, SBSP3"
+
 FALLBACK_IBOV = [
     "ABEV3", "ASAI3", "AURE3", "AZUL4", "B3SA3", "BBAS3", "BBDC3", "BBDC4",
     "BBSE3", "BEEF3", "BPAC11", "BRAP4", "BRFS3", "BRKM5", "CCRO3", "CMIG4",
@@ -292,6 +294,38 @@ def calc_score_series(prices: pd.DataFrame, asset_col: str, benchmark_col: str, 
     return df.dropna(subset=["Score"])
 
 
+def enable_horizontal_zoom(fig: go.Figure, range_slider: bool = True) -> go.Figure:
+    """Ativa controles úteis para zoom/pan no eixo horizontal dos gráficos temporais."""
+    fig.update_xaxes(
+        rangeslider=dict(visible=range_slider),
+        rangeselector=dict(
+            buttons=list([
+                dict(count=1, label="1m", step="month", stepmode="backward"),
+                dict(count=3, label="3m", step="month", stepmode="backward"),
+                dict(count=6, label="6m", step="month", stepmode="backward"),
+                dict(count=1, label="1a", step="year", stepmode="backward"),
+                dict(step="all", label="Tudo"),
+            ])
+        ),
+        type="date",
+    )
+    fig.update_layout(dragmode="pan")
+    return fig
+
+
+def plotly_time_chart(fig: go.Figure, key: str):
+    """Renderiza gráfico Plotly com barra de ferramentas ativa para zoom horizontal."""
+    st.plotly_chart(
+        fig,
+        width="stretch",
+        key=key,
+        config={
+            "scrollZoom": True,
+            "displayModeBar": True,
+        },
+    )
+
+
 def render_score_indicator(prices: pd.DataFrame, asset_col: str, benchmark_col: str, windows: List[int], title: str):
     score_df = calc_score_series(prices, asset_col, benchmark_col, windows)
     if score_df.empty:
@@ -343,13 +377,14 @@ def render_score_indicator(prices: pd.DataFrame, asset_col: str, benchmark_col: 
     fig.add_hline(y=0, line_width=1, line_dash="dash", annotation_text="Zero", annotation_position="bottom right")
     fig.update_layout(
         title=title,
-        yaxis_title="Score relativo contra IBOV (%)",
+        yaxis_title="Score relativo (%)",
         xaxis_title="Data",
         legend_title="Indicador",
         hovermode="x unified",
-        height=600,
+        height=650,
     )
-    st.plotly_chart(fig, width="stretch")
+    enable_horizontal_zoom(fig, range_slider=True)
+    plotly_time_chart(fig, key=f"score_indicator_{asset_col}_{benchmark_col}")
 
     last = score_df.iloc[-1]
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -617,7 +652,7 @@ with st.sidebar:
     end = st.date_input("Data final", value=date.today())
     windows_input = st.multiselect("Janelas de ranking", [5, 20, 60, 120, 252], default=[5, 20, 60, 120])
     top_n = st.slider("Quantidade no gráfico", min_value=5, max_value=40, value=15)
-    manual_text = st.text_area("Lista manual de ativos", value="PETR4, VALE3, ITUB4, BBAS3, BBDC4, BPAC11, AXIA3, PRIO3, WEGE3, SBSP3")
+    manual_text = st.text_area("Lista manual de ativos", value=DEFAULT_MANUAL_ASSETS)
 
     uploaded = None
     if source_mode == "Upload CSV":
@@ -804,8 +839,18 @@ try:
                 ytk = f"{br}.SA"
                 if ytk in rs_curves.columns:
                     fig3.add_trace(go.Scatter(x=rs_curves.index, y=rs_curves[ytk], mode="lines", name=br))
-            fig3.update_layout(title=f"Linha de Força Relativa normalizada — Ativo / {benchmark_label}, base 100", yaxis_title="RS base 100")
-            st.plotly_chart(fig3, width="stretch")
+            fig3.update_layout(
+                title=f"Linha de Força Relativa normalizada — Ativo / {benchmark_label}, base 100",
+                yaxis_title="RS base 100",
+                xaxis_title="Data",
+                hovermode="x unified",
+                height=620,
+            )
+            enable_horizontal_zoom(fig3, range_slider=True)
+            plotly_time_chart(fig3, key="rs_line_chart")
+            st.caption(
+                "Use os botões 1m/3m/6m/1a/Tudo, arraste o range slider inferior ou use a roda do mouse para ajustar o zoom no eixo horizontal."
+            )
 
     with tab4:
         if ranking.empty or prices.empty:
@@ -832,6 +877,9 @@ try:
                 benchmark,
                 windows,
                 title=f"Indicador visual de Score Relativo — {selected_score_asset} x {benchmark_label}",
+            )
+            st.caption(
+                "Use os botões 1m/3m/6m/1a/Tudo, arraste o range slider inferior ou use a roda do mouse para ajustar o zoom no eixo horizontal."
             )
 
     with tab5:
