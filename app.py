@@ -344,6 +344,10 @@ def render_score_indicator(prices: pd.DataFrame, asset_col: str, benchmark_col: 
     # O histograma usa o Score Elite porque ele é o score final do modelo.
     # As linhas permitem comparar o Score Simples, sem ajuste de qualidade,
     # com o Score Elite, ajustado por Sharpe + Sortino.
+    # A linha de fechamento do ativo é plotada no eixo Y secundário para comparar
+    # a evolução do preço com a evolução da força relativa em cada dia.
+    close_series = prices[asset_col].reindex(score_df.index).dropna() if asset_col in prices.columns else pd.Series(dtype=float)
+
     fig = go.Figure()
     fig.add_trace(go.Bar(
         x=score_df.index,
@@ -352,6 +356,7 @@ def render_score_indicator(prices: pd.DataFrame, asset_col: str, benchmark_col: 
         marker_color=bar_colors,
         opacity=0.45,
         hovertemplate="Data=%{x}<br>Score Elite=%{y:.2f}%<extra></extra>",
+        yaxis="y",
     ))
     fig.add_trace(go.Scatter(
         x=score_df.index,
@@ -373,11 +378,29 @@ def render_score_indicator(prices: pd.DataFrame, asset_col: str, benchmark_col: 
         mode="lines",
         name="MM20 do Score Elite",
         line=dict(width=2, dash="dot"),
+        yaxis="y",
     ))
+    if not close_series.empty:
+        fig.add_trace(go.Scatter(
+            x=close_series.index,
+            y=close_series,
+            mode="lines",
+            name=f"Fechamento diário — {yahoo_to_br(asset_col)}",
+            line=dict(width=2),
+            opacity=0.85,
+            yaxis="y2",
+            hovertemplate="Data=%{x}<br>Fechamento=%{y:.2f}<extra></extra>",
+        ))
     fig.add_hline(y=0, line_width=1, line_dash="dash", annotation_text="Zero", annotation_position="bottom right")
     fig.update_layout(
         title=title,
-        yaxis_title="Score relativo (%)",
+        yaxis=dict(title="Score relativo (%)", side="left"),
+        yaxis2=dict(
+            title=f"Preço de fechamento — {yahoo_to_br(asset_col)}",
+            overlaying="y",
+            side="right",
+            showgrid=False,
+        ),
         xaxis_title="Data",
         legend_title="Indicador",
         hovermode="x unified",
@@ -402,6 +425,7 @@ def render_score_indicator(prices: pd.DataFrame, asset_col: str, benchmark_col: 
 - **Score Elite**: Score Simples ponderado pelo **Fator de Qualidade**, calculado com Sharpe 20d e Sortino 20d.
 - **MM20 do Score Elite**: média móvel de 20 pregões do Score Elite; ajuda a identificar consistência ou perda de força.
 - **Histograma**: barras do Score Elite coloridas conforme o sinal e a direção do score.
+- **Fechamento diário**: preço de fechamento do ativo no eixo secundário à direita; permite comparar se o preço está confirmando, antecipando ou divergindo da força relativa.
 
 Quando o **Score Elite** está acima de zero e acima da MM20, o ativo está em liderança relativa com melhor qualidade de retorno.
 Quando o **Score Simples** sobe, mas o **Score Elite** não acompanha, o ativo pode estar subindo com pior relação retorno/risco.
