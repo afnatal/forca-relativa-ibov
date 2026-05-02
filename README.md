@@ -75,3 +75,30 @@ O app agora possui uma seleção fixa de benchmark com nomes amigáveis:
 - NASDAQ → `^IXIC`
 
 Também existe um campo opcional para benchmark personalizado. Quando preenchido, ele substitui a opção fixa selecionada.
+
+## Indicador de Perda de Força Relativa (PFR)
+
+Esta versão inclui o **PFR**, criado para identificar liderança passada com perda de tração recente.
+
+O PFR é ativado apenas quando o ativo ainda tem **Relativo 60d positivo**. A partir disso, soma pontos:
+
+- Relativo 20d < 0: +2 pontos
+- Relativo 5d < 0: +1 ponto
+- Linha RS abaixo da MM20: +1 ponto
+- Score Elite < 0: +1 ponto
+
+Classificação:
+
+- 0: Sem alerta
+- 1: Monitorar
+- 2 a 3: Atenção: perdendo força
+- 4 ou mais: Perda confirmada
+
+Na aba **Indicador Score**, os alertas relevantes aparecem como marcadores triangulares no gráfico.
+
+## Benchmarks fixos
+
+- IBOV → `^BVSP`
+- SPX → `^SPX`
+- NASDAQ → `^IXIC`
+- DXY (Dollar Index) → `DX-Y.NYB`
