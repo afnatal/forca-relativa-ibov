@@ -46,6 +46,22 @@ BENCHMARK_OPTIONS = {
 
 MULTI_BENCHMARK_OPTIONS = BENCHMARK_OPTIONS.copy()
 
+SHORT_SCORE_WEIGHTS = {5: 0.30, 20: 0.70}
+
+
+def classify_short_signal(score_elite, score_short):
+    """Classifica a leitura tática do Score Curto contra o Score Elite estrutural."""
+    if pd.isna(score_elite) or pd.isna(score_short):
+        return "Sem dados"
+    if score_elite > 0 and score_short > 0:
+        return "Timing favorável"
+    if score_elite > 0 and score_short <= 0:
+        return "Pullback / perda tática"
+    if score_elite <= 0 and score_short > 0:
+        return "Reversão inicial"
+    return "Fraco no curto"
+
+
 DEFAULT_MANUAL_ASSETS = "PETR4, VALE3, ITUB4, BBAS3, BBDC4, BPAC11, AXIA3, PRIO3, WEGE3, SBSP3"
 
 FALLBACK_IBOV = [
@@ -219,6 +235,9 @@ def calc_metrics(prices: pd.DataFrame, benchmark: str, windows: List[int], ma_wi
         rs_curves[tk] = rs_norm.reindex(prices.index)
         row = {"Ativo": yahoo_to_br(tk)}
         score = 0.0
+        short_score = 0.0
+        short_used_weight = 0.0
+        rel_by_window = {}
         weights = {5: 0.10, 20: 0.30, 60: 0.30, 120: 0.30, 252: 0.10}
         used_weight = 0.0
         for w in windows:
@@ -226,19 +245,26 @@ def calc_metrics(prices: pd.DataFrame, benchmark: str, windows: List[int], ma_wi
                 ret_asset = asset.iloc[-1] / asset.iloc[-w - 1] - 1
                 ret_bench = bm.iloc[-1] / bm.iloc[-w - 1] - 1
                 rel = ret_asset - ret_bench
+                rel_by_window[w] = rel
                 row[f"Ativo {w}d %"] = ret_asset * 100
                 row[f"Benchmark {w}d %"] = ret_bench * 100
                 row[f"Relativo {w}d %"] = rel * 100
                 wt = weights.get(w, 1 / len(windows))
                 score += rel * wt
                 used_weight += wt
+                if w in SHORT_SCORE_WEIGHTS:
+                    short_score += rel * SHORT_SCORE_WEIGHTS[w]
+                    short_used_weight += SHORT_SCORE_WEIGHTS[w]
         rs_ma = rs.rolling(ma_window).mean()
         row["RS Atual"] = rs_norm.iloc[-1]
         row["RS x MM20 %"] = ((rs.iloc[-1] / rs_ma.iloc[-1] - 1) * 100) if len(rs_ma.dropna()) else np.nan
         row["Score Simples"] = (score / used_weight * 100) if used_weight else np.nan
+        row["Score Curto 5/20"] = (short_score / short_used_weight * 100) if short_used_weight else np.nan
         q = calc_quality_metrics(asset, rf_daily=0.0, window=20)
         row.update(q)
         row["Score Elite"] = row["Score Simples"] * row["Qualidade S/S"] if pd.notna(row["Score Simples"]) and pd.notna(row["Qualidade S/S"]) else np.nan
+        row["Score Curto Elite"] = row["Score Curto 5/20"] * row["Qualidade S/S"] if pd.notna(row["Score Curto 5/20"]) and pd.notna(row["Qualidade S/S"]) else np.nan
+        row["Sinal Curto"] = classify_short_signal(row["Score Elite"], row["Score Curto Elite"])
         row["Score"] = row["Score Elite"]
         row["Regime"] = classify_regime(row)
         pfr = classify_loss_of_strength(row)
@@ -272,11 +298,24 @@ def calc_score_series(prices: pd.DataFrame, asset_col: str, benchmark_col: str, 
         total_weight = total_weight.add(rel.notna().astype(float) * wt, fill_value=0)
 
     score_pct = (score / total_weight.replace(0, np.nan)) * 100
+
+    # Score Curto 5/20: versão tática, voltada para timing de entrada/saída.
+    # Usa somente a força relativa de 5 e 20 pregões, com maior peso para 20d.
+    short_score = pd.Series(0.0, index=aligned.index)
+    short_total_weight = pd.Series(0.0, index=aligned.index)
+    for w, wt in SHORT_SCORE_WEIGHTS.items():
+        rel = asset.pct_change(w) - bench.pct_change(w)
+        short_score = short_score.add(rel.fillna(0) * wt, fill_value=0)
+        short_total_weight = short_total_weight.add(rel.notna().astype(float) * wt, fill_value=0)
+    short_score_pct = (short_score / short_total_weight.replace(0, np.nan)) * 100
+
     quality_factor = rolling_quality_factor(asset, rf_daily=0.0, window=20)
     df = pd.DataFrame(index=aligned.index)
     df["Score Simples"] = score_pct
+    df["Score Curto 5/20"] = short_score_pct
     df["Qualidade S/S"] = quality_factor
     df["Score Elite"] = df["Score Simples"] * df["Qualidade S/S"]
+    df["Score Curto Elite"] = df["Score Curto 5/20"] * df["Qualidade S/S"]
     df["Score"] = df["Score Elite"]
     df["MM20 Score"] = df["Score"].rolling(ma_window).mean()
     df["Histograma"] = df["Score"] - df["MM20 Score"]
@@ -382,6 +421,22 @@ def render_score_indicator(prices: pd.DataFrame, asset_col: str, benchmark_col: 
     ))
     fig.add_trace(go.Scatter(
         x=score_df.index,
+        y=score_df["Score Curto 5/20"],
+        mode="lines",
+        name="Score Curto 5/20",
+        line=dict(width=2, dash="longdash"),
+        opacity=0.85,
+    ))
+    fig.add_trace(go.Scatter(
+        x=score_df.index,
+        y=score_df["Score Curto Elite"],
+        mode="lines",
+        name="Score Curto Elite",
+        line=dict(width=2),
+        opacity=0.85,
+    ))
+    fig.add_trace(go.Scatter(
+        x=score_df.index,
         y=score_df["Score Elite"],
         mode="lines",
         name="Score Elite (Sharpe + Sortino)",
@@ -448,13 +503,15 @@ def render_score_indicator(prices: pd.DataFrame, asset_col: str, benchmark_col: 
     plotly_time_chart(fig, key=f"score_indicator_{asset_col}_{benchmark_col}")
 
     last = score_df.iloc[-1]
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
     c1.metric("Score Simples", f"{last['Score Simples']:.2f}%" if pd.notna(last["Score Simples"]) else "n/d")
-    c2.metric("Fator Qualidade", f"{last['Qualidade S/S']:.2f}x" if pd.notna(last["Qualidade S/S"]) else "n/d")
-    c3.metric("Score Elite", f"{last['Score Elite']:.2f}%" if pd.notna(last["Score Elite"]) else "n/d")
-    c4.metric("MM20 Elite", f"{last['MM20 Score']:.2f}%" if pd.notna(last["MM20 Score"]) else "n/d")
-    c5.metric("Condição", str(last["Condição"]))
-    c6.metric("Alerta PFR", str(last["Alerta PFR"]))
+    c2.metric("Score Curto", f"{last['Score Curto 5/20']:.2f}%" if pd.notna(last["Score Curto 5/20"]) else "n/d")
+    c3.metric("Fator Qualidade", f"{last['Qualidade S/S']:.2f}x" if pd.notna(last["Qualidade S/S"]) else "n/d")
+    c4.metric("Score Elite", f"{last['Score Elite']:.2f}%" if pd.notna(last["Score Elite"]) else "n/d")
+    c5.metric("Score Curto Elite", f"{last['Score Curto Elite']:.2f}%" if pd.notna(last["Score Curto Elite"]) else "n/d")
+    c6.metric("MM20 Elite", f"{last['MM20 Score']:.2f}%" if pd.notna(last["MM20 Score"]) else "n/d")
+    c7.metric("Condição", str(last["Condição"]))
+    c8.metric("Alerta PFR", str(last["Alerta PFR"]))
 
     st.markdown(
         """
@@ -462,6 +519,8 @@ def render_score_indicator(prices: pd.DataFrame, asset_col: str, benchmark_col: 
 
 - **Score Simples**: força relativa pura do ativo contra o IBOV nas janelas selecionadas.
 - **Score Elite**: Score Simples ponderado pelo **Fator de Qualidade**, calculado com Sharpe 20d e Sortino 20d.
+- **Score Curto 5/20**: versão tática do Score, usando somente 5 e 20 pregões; serve para timing e vira antes do Score completo.
+- **Score Curto Elite**: Score Curto 5/20 ponderado pelo mesmo Fator de Qualidade.
 - **MM20 do Score Elite**: média móvel de 20 pregões do Score Elite; ajuda a identificar consistência ou perda de força.
 - **Histograma**: barras do Score Elite coloridas conforme o sinal e a direção do score.
 - **Fechamento diário**: preço de fechamento do ativo no eixo secundário à direita; permite comparar se o preço está confirmando, antecipando ou divergindo da força relativa.
@@ -469,6 +528,7 @@ def render_score_indicator(prices: pd.DataFrame, asset_col: str, benchmark_col: 
 
 Quando o **Score Elite** está acima de zero e acima da MM20, o ativo está em liderança relativa com melhor qualidade de retorno.
 Quando o **Score Simples** sobe, mas o **Score Elite** não acompanha, o ativo pode estar subindo com pior relação retorno/risco.
+Quando o **Score Curto** melhora antes do **Score Elite**, pode ser sinal inicial de rotação positiva; quando piora com Score Elite ainda positivo, pode indicar pullback ou perda tática de força.
         """
     )
 
@@ -631,10 +691,12 @@ O **Score** é uma média ponderada da performance relativa do ativo contra o be
 |---|---|---|
 | **Relativo Nd %** | `Retorno do ativo em N pregões - Retorno do benchmark em N pregões` | Mede se o ativo ganhou ou perdeu do IBOV em cada janela. |
 | **Score Simples** | Média ponderada dos retornos relativos disponíveis | Mede força relativa pura, sem ajuste de risco. |
+| **Score Curto 5/20** | `0,3 × RS 5d + 0,7 × RS 20d` | Mede momentum relativo tático para timing de entrada/saída. |
 | **Sharpe 20d** | Retorno médio excedente / volatilidade total dos retornos | Mede consistência do retorno em relação à volatilidade total. |
 | **Sortino 20d** | Retorno médio excedente / volatilidade negativa | Mede qualidade do retorno penalizando mais as quedas. |
 | **Fator de Qualidade** | `1 + ((0,6 × Sharpe 20d + 0,4 × Sortino 20d) / 2)` limitado entre `0,25x` e `2,00x` | Aumenta ou reduz o Score conforme a qualidade do movimento. |
 | **Score Elite** | `Score Simples × Fator de Qualidade` | Score final do ranking, combinando força relativa com qualidade de retorno. |
+| **Score Curto Elite** | `Score Curto 5/20 × Fator de Qualidade` | Versão tática ajustada por Sharpe + Sortino. |
 
 **Score simples:**
 
@@ -643,6 +705,14 @@ O **Score** é uma média ponderada da performance relativa do ativo contra o be
 **Score ELITE:**
 
 `Score Elite = Score Simples × Fator de Qualidade`
+
+**Score Curto 5/20:**
+
+`Score Curto = 0,3 × Relativo 5d + 0,7 × Relativo 20d`
+
+**Score Curto Elite:**
+
+`Score Curto Elite = Score Curto × Fator de Qualidade`
 
 **Fator de Qualidade:** calculado com 60% de Sharpe 20d e 40% de Sortino 20d. O fator é limitado entre 0,25 e 2,00 para evitar distorções por outliers.
 
@@ -667,6 +737,9 @@ Quando nem todas as janelas estão selecionadas ou disponíveis, o app recalibra
 - **Score negativo:** ativo está performando pior que o benchmark.
 - **Score alto e consistente:** possível liderança relativa.
 - **Score caindo ou abaixo da MM20:** perda de força relativa.
+- **Score Curto positivo com Score Elite positivo:** timing favorável dentro de liderança.
+- **Score Curto negativo com Score Elite positivo:** possível pullback ou perda tática de força.
+- **Score Curto positivo com Score Elite negativo:** possível reversão inicial, ainda sem confirmação estrutural.
             """
         )
         if context == "indicator":
@@ -732,6 +805,8 @@ def build_multi_benchmark_summary(asset_prices: pd.DataFrame, benchmark_prices: 
                 "Regime": row.get("Regime"),
                 "Score Elite": row.get("Score Elite"),
                 "Score Simples": row.get("Score Simples"),
+                "Score Curto Elite": row.get("Score Curto Elite"),
+                "Sinal Curto": row.get("Sinal Curto"),
                 "Sharpe 20d": row.get("Sharpe 20d"),
                 "Sortino 20d": row.get("Sortino 20d"),
                 "Relativo 20d %": row.get("Relativo 20d %"),
