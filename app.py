@@ -312,9 +312,6 @@ def calc_metrics(prices: pd.DataFrame, benchmark: str, windows: List[int], ma_wi
         row["Sinal Curto"] = classify_short_signal(row["Score Elite"], row["Score Curto Elite"])
         row["Score"] = row["Score Elite"]
         row["Regime"] = classify_regime(row)
-        pfr = classify_loss_of_strength(row)
-        row["Alerta PFR"] = pfr["Alerta PFR"]
-        row["PFR Pontos"] = pfr["PFR Pontos"]
         rows.append(row)
     ranking = pd.DataFrame(rows).sort_values("Score Elite", ascending=False) if rows else pd.DataFrame()
     return ranking, rs_curves
@@ -368,18 +365,6 @@ def calc_score_series(prices: pd.DataFrame, asset_col: str, benchmark_col: str, 
     df["MM20 Score"] = df["Score"].rolling(ma_window).mean()
     df["Histograma"] = df["Score"] - df["MM20 Score"]
     df["Direção"] = df["Score"].diff()
-
-    # Indicador de Perda de Força Relativa (PFR).
-    # Ele busca situações em que o ativo ainda tem uma leitura de força no horizonte maior,
-    # mas começa a perder tração nas janelas mais recentes e/ou perde a média da própria RS.
-    df["Relativo 5d %"] = (asset.pct_change(5) - bench.pct_change(5)) * 100
-    df["Relativo 20d %"] = (asset.pct_change(20) - bench.pct_change(20)) * 100
-    df["Relativo 60d %"] = (asset.pct_change(60) - bench.pct_change(60)) * 100
-    rs = asset / bench
-    rs_ma = rs.rolling(ma_window).mean()
-    df["RS x MM20 %"] = (rs / rs_ma - 1) * 100
-    df["PFR Pontos"] = calc_loss_of_strength_points_series(df)
-    df["Alerta PFR"] = df["PFR Pontos"].apply(label_loss_of_strength)
 
     def classify_bar(row):
         if pd.isna(row["Score"]) or pd.isna(row["Direção"]):
@@ -505,28 +490,6 @@ def render_score_indicator(prices: pd.DataFrame, asset_col: str, benchmark_col: 
             hovertemplate="Data=%{x}<br>Fechamento=%{y:.2f}<extra></extra>",
         ))
 
-    # Marcadores do Indicador de Perda de Força Relativa (PFR).
-    pfr_mask = score_df["Alerta PFR"].isin(["Atenção: perdendo força", "Perda confirmada"])
-    if pfr_mask.any():
-        pfr_colors = score_df.loc[pfr_mask, "Alerta PFR"].map({
-            "Atenção: perdendo força": "#F28E2B",
-            "Perda confirmada": "#D62728",
-        }).fillna("#F28E2B")
-        fig.add_trace(go.Scatter(
-            x=score_df.index[pfr_mask],
-            y=score_df.loc[pfr_mask, "Score Elite"],
-            mode="markers",
-            name="Alerta PFR",
-            marker=dict(size=11, symbol="triangle-down", color=pfr_colors, line=dict(width=1, color="#333333")),
-            hovertemplate=(
-                "Data=%{x}<br>Score Elite=%{y:.2f}%<br>"
-                "PFR=%{customdata[0]}<br>Pontos=%{customdata[1]:.0f}<extra></extra>"
-            ),
-            customdata=np.column_stack([
-                score_df.loc[pfr_mask, "Alerta PFR"],
-                score_df.loc[pfr_mask, "PFR Pontos"],
-            ]),
-        ))
     fig.add_hline(y=0, line_width=1, line_dash="dash", annotation_text="Zero", annotation_position="bottom right")
     fig.update_layout(
         title=title,
@@ -546,7 +509,7 @@ def render_score_indicator(prices: pd.DataFrame, asset_col: str, benchmark_col: 
     plotly_time_chart(fig, key=f"score_indicator_{asset_col}_{benchmark_col}")
 
     last = score_df.iloc[-1]
-    c1, c2, c3, c4, c5, c6, c7, c8, c9 = st.columns(9)
+    c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
     c1.metric("Score Simples", f"{last['Score Simples']:.2f}%" if pd.notna(last["Score Simples"]) else "n/d")
     c2.metric("Score Curto", f"{last['Score Curto 5/20']:.2f}%" if pd.notna(last["Score Curto 5/20"]) else "n/d")
     c3.metric("Fator Qualidade", f"{last['Qualidade S/S']:.2f}x" if pd.notna(last["Qualidade S/S"]) else "n/d")
@@ -555,7 +518,6 @@ def render_score_indicator(prices: pd.DataFrame, asset_col: str, benchmark_col: 
     c6.metric("Score Sortino", f"{last['Score Sortino']:.2f}%" if pd.notna(last["Score Sortino"]) else "n/d")
     c7.metric("MM20 Elite", f"{last['MM20 Score']:.2f}%" if pd.notna(last["MM20 Score"]) else "n/d")
     c8.metric("Condição", str(last["Condição"]))
-    c9.metric("Alerta PFR", str(last["Alerta PFR"]))
 
     st.markdown(
         """
@@ -569,7 +531,6 @@ def render_score_indicator(prices: pd.DataFrame, asset_col: str, benchmark_col: 
 - **MM20 do Score Elite**: média móvel de 20 pregões do Score Elite; ajuda a identificar consistência ou perda de força.
 - **Histograma**: barras do Score Elite coloridas conforme o sinal e a direção do score.
 - **Fechamento diário**: preço de fechamento do ativo no eixo secundário à direita; permite comparar se o preço está confirmando, antecipando ou divergindo da força relativa.
-- **Alerta PFR**: triângulos no gráfico indicam perda de força relativa quando o ativo ainda tem relativo 60d positivo, mas começa a perder tração em 20d/5d, perde a MM20 da RS ou tem Score Elite negativo.
 
 Quando o **Score Elite** está acima de zero e acima da MM20, o ativo está em liderança relativa com melhor qualidade de retorno.
 Quando o **Score Simples** sobe, mas o **Score Elite** não acompanha, o ativo pode estar subindo com pior relação retorno/risco.
@@ -577,99 +538,6 @@ Quando o **Score Sortino** fica acima do Score Elite ou se mantém positivo, a f
 Quando o **Score Curto** melhora antes do **Score Elite**, pode ser sinal inicial de rotação positiva; quando piora com Score Elite ainda positivo, pode indicar pullback ou perda tática de força.
         """
     )
-
-
-def label_loss_of_strength(points: float) -> str:
-    """Classifica o Indicador de Perda de Força Relativa (PFR)."""
-    if pd.isna(points):
-        return "Sem dados"
-    if points >= 4:
-        return "Perda confirmada"
-    if points >= 2:
-        return "Atenção: perdendo força"
-    if points >= 1:
-        return "Monitorar"
-    return "Sem alerta"
-
-
-def classify_loss_of_strength(row: Dict) -> Dict[str, object]:
-    """Calcula o alerta atual de Perda de Força Relativa para a tabela de ranking.
-
-    A lógica procura uma situação típica de liderança passada com perda de tração:
-    o relativo de 60 dias ainda é positivo, mas os períodos mais curtos começam a
-    enfraquecer, a linha RS perde a MM20 ou o Score Elite fica negativo.
-    """
-    r5 = row.get("Relativo 5d %", np.nan)
-    r20 = row.get("Relativo 20d %", np.nan)
-    r60 = row.get("Relativo 60d %", np.nan)
-    rs_mm = row.get("RS x MM20 %", np.nan)
-    score = row.get("Score Elite", row.get("Score", np.nan))
-
-    if pd.isna(r60) or r60 <= 0:
-        points = 0
-    else:
-        points = 0
-        if pd.notna(r20) and r20 < 0:
-            points += 2
-        if pd.notna(r5) and r5 < 0:
-            points += 1
-        if pd.notna(rs_mm) and rs_mm < 0:
-            points += 1
-        if pd.notna(score) and score < 0:
-            points += 1
-
-    return {"PFR Pontos": points, "Alerta PFR": label_loss_of_strength(points)}
-
-
-def calc_loss_of_strength_points_series(df: pd.DataFrame) -> pd.Series:
-    """Calcula pontuação histórica do PFR para o gráfico do Indicador Score."""
-    points = pd.Series(0, index=df.index, dtype=float)
-    base = df["Relativo 60d %"] > 0
-    points += (base & (df["Relativo 20d %"] < 0)).astype(float) * 2
-    points += (base & (df["Relativo 5d %"] < 0)).astype(float) * 1
-    points += (base & (df["RS x MM20 %"] < 0)).astype(float) * 1
-    points += (base & (df["Score Elite"] < 0)).astype(float) * 1
-    return points
-
-
-def render_loss_of_strength_explanation():
-    """Explica o Indicador de Perda de Força Relativa."""
-    with st.expander("Indicador de Perda de Força Relativa (PFR)", expanded=False):
-        st.markdown(
-            """
-O **PFR** foi criado para identificar a situação que você observou: o ativo teve liderança no período maior, mas começa a lateralizar ou perder tração enquanto o benchmark continua andando.
-
-### Objetivo
-
-Detectar **liderança passada com enfraquecimento recente**. Não é o mesmo que underperformance estrutural. O foco é encontrar ativos que ainda parecem fortes olhando o gráfico acumulado, mas já estão perdendo força relativa nas janelas mais curtas.
-
-### Critérios usados
-
-O PFR só é ativado quando o ativo ainda tem **Relativo 60d positivo**. A partir disso, soma pontos de alerta:
-
-| Critério | Pontos | Interpretação |
-|---|---:|---|
-| Relativo 20d < 0 | +2 | O ativo começou a perder para o benchmark na janela principal de swing. |
-| Relativo 5d < 0 | +1 | A perda de força apareceu também no curtíssimo prazo. |
-| RS abaixo da MM20 | +1 | A linha de força relativa perdeu sua média curta. |
-| Score Elite < 0 | +1 | A força relativa ajustada por Sharpe/Sortino ficou negativa. |
-
-### Classificação
-
-| Alerta PFR | Pontuação | Leitura |
-|---|---:|---|
-| **Sem alerta** | 0 | Sem perda relevante de força. |
-| **Monitorar** | 1 | Primeiro sinal de enfraquecimento. |
-| **Atenção: perdendo força** | 2 a 3 | Perda de tração relevante. |
-| **Perda confirmada** | 4 ou mais | Divergência forte entre liderança anterior e força atual. |
-
-### Uso prático
-
-- **RS alto + PFR alto**: ativo ainda pode parecer bom no gráfico, mas o fluxo relativo está enfraquecendo.
-- **PFR subindo**: cuidado com compras novas e com carrego por opções.
-- **PFR caindo após consolidação**: pode indicar retomada de força.
-            """
-        )
 
 
 def classify_regime(row: Dict) -> str:
@@ -710,8 +578,6 @@ def reorder_ranking_columns(df: pd.DataFrame) -> pd.DataFrame:
     if first_col is None:
         return df
     preferred = [first_col, "Regime"]
-    if "Alerta PFR" in df.columns:
-        preferred.append("Alerta PFR")
     ordered = preferred + [c for c in df.columns if c not in preferred]
     return df[ordered]
 
@@ -944,14 +810,12 @@ def build_multi_benchmark_summary(asset_prices: pd.DataFrame, benchmark_prices: 
     return summary[ordered].sort_values("Score Multi-Benchmark", ascending=False)
 
 
-def render_table(df: pd.DataFrame, title: str, show_score_explanation: bool = False, show_regime_explanation: bool = False, show_pfr_explanation: bool = False):
+def render_table(df: pd.DataFrame, title: str, show_score_explanation: bool = False, show_regime_explanation: bool = False):
     st.subheader(title)
     if show_score_explanation:
         render_score_explanation(context="ranking")
     if show_regime_explanation:
         render_regime_explanation()
-    if show_pfr_explanation:
-        render_loss_of_strength_explanation()
     if df.empty:
         st.warning("Sem dados suficientes para montar a tabela.")
         return
@@ -1126,7 +990,7 @@ try:
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Ranking ativos", "Setores", "Linha RS", "Indicador Score", "Mapa de calor", "Multi-benchmark"])
 
     with tab1:
-        render_table(ranking, f"Ranking de ativos contra {benchmark_label}", show_score_explanation=True, show_regime_explanation=True, show_pfr_explanation=True)
+        render_table(ranking, f"Ranking de ativos contra {benchmark_label}", show_score_explanation=True, show_regime_explanation=True)
         if not ranking.empty:
             fig = px.bar(
                 ranking.head(top_n),
@@ -1172,7 +1036,7 @@ try:
                 st.warning("Sem dados para: " + ", ".join(missing) + ". Esses índices foram ignorados no ranking setorial.")
         if not sector_ranking.empty:
             cols = ["Índice"] + [c for c in sector_ranking.columns if c != "Índice"]
-            render_table(sector_ranking[cols], f"Ranking setorial contra {benchmark_label}", show_score_explanation=True, show_regime_explanation=True, show_pfr_explanation=True)
+            render_table(sector_ranking[cols], f"Ranking setorial contra {benchmark_label}", show_score_explanation=True, show_regime_explanation=True)
             fig2 = px.bar(
                 sector_ranking,
                 x="Índice",
@@ -1220,7 +1084,6 @@ try:
             score_options += [a for a in all_available if a not in score_options]
             render_score_explanation(context="indicator")
             render_regime_explanation()
-            render_loss_of_strength_explanation()
             selected_score_asset = st.selectbox(
                 "Ativo para o indicador visual",
                 score_options,
