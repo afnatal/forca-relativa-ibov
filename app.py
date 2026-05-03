@@ -735,6 +735,49 @@ Quando nem todas as janelas estão selecionadas ou disponíveis, o app recalibra
             )
 
 
+
+def render_rs_explanation():
+    """Mostra uma explicação clara sobre a Linha RS (Relative Strength)."""
+    with st.expander("Como a Linha RS é calculada", expanded=False):
+        st.markdown(
+            """
+A **Linha RS** mede a **força relativa do ativo contra o benchmark selecionado**.
+
+Ela mostra se o ativo está performando melhor ou pior do que o índice de comparação ao longo do tempo.
+
+### Cálculo bruto
+
+`RS = Preço de fechamento do ativo / Preço de fechamento do benchmark`
+
+Exemplo: se o benchmark selecionado for o IBOV, a linha compara o ativo contra o IBOV dia a dia.
+
+### Normalização usada no app
+
+Para facilitar a leitura visual, o app transforma a linha para **base 100**:
+
+`RS base 100 = (RS do dia / RS inicial do período) × 100`
+
+Assim, a linha começa próxima de 100 e fica mais fácil comparar vários ativos no mesmo gráfico.
+
+### Como interpretar
+
+| Movimento da Linha RS | Interpretação |
+|---|---|
+| **Linha RS subindo** | O ativo está performando melhor que o benchmark. |
+| **Linha RS caindo** | O ativo está performando pior que o benchmark. |
+| **Linha RS lateral** | O ativo está andando de forma parecida com o benchmark. |
+| **Linha RS acima da MM20** | Força relativa de curto prazo ainda favorável. |
+| **Linha RS abaixo da MM20** | Perda de tração relativa. |
+
+### Diferença entre Linha RS e Score
+
+- **Linha RS**: mostra a evolução acumulada da força relativa no gráfico.
+- **Score**: transforma essa força relativa em um número ponderado por janelas, como 5d, 20d, 60d e 120d, podendo ainda ser ajustado por Sharpe e Sortino na versão ELITE.
+
+Em resumo: a **Linha RS mostra o caminho**; o **Score resume a condição atual em forma de ranking e regime**.
+            """
+        )
+
 def render_regime_explanation():
     """Mostra os critérios usados para definir o regime de força relativa."""
     with st.expander("Critérios para definição do Regime", expanded=False):
@@ -1052,6 +1095,7 @@ try:
             st.warning("Não consegui baixar dados suficientes para os índices setoriais informados. Ajuste os tickers na lateral e clique em Atualizar análise.")
 
     with tab3:
+        render_rs_explanation()
         if ranking.empty or rs_curves.empty:
             st.warning("Sem curvas de força relativa.")
         else:
