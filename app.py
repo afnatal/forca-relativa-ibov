@@ -396,8 +396,9 @@ def render_score_indicator(prices: pd.DataFrame, asset_col: str, benchmark_col: 
     bar_colors = [color_map.get(c, "#B0B0B0") for c in score_df["Condição"]]
 
     # O histograma usa o Score Elite porque ele é o score final do modelo.
-    # As linhas permitem comparar o Score Simples, sem ajuste de qualidade,
-    # com o Score Elite, ajustado por Sharpe + Sortino.
+    # O gráfico foi mantido mais limpo: não exibe mais o Score Simples
+    # nem o Score Curto 5/20 puro, preservando o foco no Score Elite,
+    # no Score Curto Elite, na MM20 do Score Elite e no preço em eixo secundário.
     # A linha de fechamento do ativo é plotada no eixo Y secundário para comparar
     # a evolução do preço com a evolução da força relativa em cada dia.
     close_series = prices[asset_col].reindex(score_df.index).dropna() if asset_col in prices.columns else pd.Series(dtype=float)
@@ -411,21 +412,6 @@ def render_score_indicator(prices: pd.DataFrame, asset_col: str, benchmark_col: 
         opacity=0.45,
         hovertemplate="Data=%{x}<br>Score Elite=%{y:.2f}%<extra></extra>",
         yaxis="y",
-    ))
-    fig.add_trace(go.Scatter(
-        x=score_df.index,
-        y=score_df["Score Simples"],
-        mode="lines",
-        name="Score Simples",
-        line=dict(width=2, dash="dash"),
-    ))
-    fig.add_trace(go.Scatter(
-        x=score_df.index,
-        y=score_df["Score Curto 5/20"],
-        mode="lines",
-        name="Score Curto 5/20",
-        line=dict(width=2, dash="longdash"),
-        opacity=0.85,
     ))
     fig.add_trace(go.Scatter(
         x=score_df.index,
