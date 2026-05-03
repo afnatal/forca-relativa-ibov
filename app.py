@@ -182,7 +182,12 @@ def calc_quality_metrics(asset: pd.Series, rf_daily: float = 0.0, window: int = 
     log_ret = np.log(asset / asset.shift(1)).dropna()
     recent = log_ret.tail(window)
     if len(recent) < max(5, window // 2):
-        return {"Sharpe 20d": np.nan, "Sortino 20d": np.nan, "Qualidade S/S": np.nan}
+        return {
+            "Sharpe 20d": np.nan,
+            "Sortino 20d": np.nan,
+            "Qualidade S/S": np.nan,
+            "Fator Sortino": np.nan,
+        }
 
     excess = recent - rf_daily
     vol = excess.std(ddof=0)
@@ -196,7 +201,13 @@ def calc_quality_metrics(asset: pd.Series, rf_daily: float = 0.0, window: int = 
 
     quality_raw = 0.6 * sharpe + 0.4 * sortino if pd.notna(sharpe) and pd.notna(sortino) else np.nan
     quality_factor = np.clip(1 + (quality_raw / 2), 0.25, 2.00) if pd.notna(quality_raw) else np.nan
-    return {"Sharpe 20d": sharpe, "Sortino 20d": sortino, "Qualidade S/S": quality_factor}
+    sortino_factor = np.clip(1 + (sortino / 2), 0.25, 2.00) if pd.notna(sortino) else np.nan
+    return {
+        "Sharpe 20d": sharpe,
+        "Sortino 20d": sortino,
+        "Qualidade S/S": quality_factor,
+        "Fator Sortino": sortino_factor,
+    }
 
 
 def rolling_quality_factor(asset: pd.Series, rf_daily: float = 0.0, window: int = 20) -> pd.Series:
@@ -215,6 +226,38 @@ def rolling_quality_factor(asset: pd.Series, rf_daily: float = 0.0, window: int 
     quality_raw = 0.6 * sharpe + 0.4 * sortino
     quality_factor = (1 + quality_raw / 2).clip(lower=0.25, upper=2.00)
     return quality_factor
+
+
+def rolling_sortino_factor(asset: pd.Series, rf_daily: float = 0.0, window: int = 20) -> pd.Series:
+    """Série histórica do fator de qualidade baseado somente em Sortino.
+
+    Esse fator penaliza apenas volatilidade negativa, tornando o Score mais
+    defensivo e mais exigente para swing/carrego com opções.
+    """
+    log_ret = np.log(asset / asset.shift(1))
+    excess = log_ret - rf_daily
+    mean = excess.rolling(window).mean()
+    downside = excess.where(excess < 0)
+    down_vol = downside.rolling(window, min_periods=max(5, window // 2)).std(ddof=0)
+    sortino = mean / down_vol.replace(0, np.nan)
+    sortino_factor = (1 + sortino / 2).clip(lower=0.25, upper=2.00)
+    return sortino_factor
+
+
+def classify_premium_quality(row: Dict) -> str:
+    """Classifica ativos com força relativa positiva e boa qualidade por Sortino."""
+    score = row.get("Score Elite", np.nan)
+    score_sortino = row.get("Score Sortino", np.nan)
+    sortino = row.get("Sortino 20d", np.nan)
+    if pd.notna(score) and pd.notna(score_sortino) and pd.notna(sortino):
+        if score > 0 and score_sortino > 0 and sortino >= 1.0:
+            return "Premium Sortino"
+        if score > 0 and score_sortino > 0:
+            return "Qualidade positiva"
+        if score > 0 and score_sortino <= 0:
+            return "Força com risco"
+    return "Sem confirmação"
+
 def calc_metrics(prices: pd.DataFrame, benchmark: str, windows: List[int], ma_window: int = 20) -> Tuple[pd.DataFrame, pd.DataFrame]:
     prices = prices.dropna(how="all").ffill()
     if benchmark not in prices.columns:
@@ -263,7 +306,9 @@ def calc_metrics(prices: pd.DataFrame, benchmark: str, windows: List[int], ma_wi
         q = calc_quality_metrics(asset, rf_daily=0.0, window=20)
         row.update(q)
         row["Score Elite"] = row["Score Simples"] * row["Qualidade S/S"] if pd.notna(row["Score Simples"]) and pd.notna(row["Qualidade S/S"]) else np.nan
+        row["Score Sortino"] = row["Score Simples"] * row["Fator Sortino"] if pd.notna(row["Score Simples"]) and pd.notna(row["Fator Sortino"]) else np.nan
         row["Score Curto Elite"] = row["Score Curto 5/20"] * row["Qualidade S/S"] if pd.notna(row["Score Curto 5/20"]) and pd.notna(row["Qualidade S/S"]) else np.nan
+        row["Qualidade Premium"] = classify_premium_quality(row)
         row["Sinal Curto"] = classify_short_signal(row["Score Elite"], row["Score Curto Elite"])
         row["Score"] = row["Score Elite"]
         row["Regime"] = classify_regime(row)
@@ -310,11 +355,14 @@ def calc_score_series(prices: pd.DataFrame, asset_col: str, benchmark_col: str, 
     short_score_pct = (short_score / short_total_weight.replace(0, np.nan)) * 100
 
     quality_factor = rolling_quality_factor(asset, rf_daily=0.0, window=20)
+    sortino_factor = rolling_sortino_factor(asset, rf_daily=0.0, window=20)
     df = pd.DataFrame(index=aligned.index)
     df["Score Simples"] = score_pct
     df["Score Curto 5/20"] = short_score_pct
     df["Qualidade S/S"] = quality_factor
+    df["Fator Sortino"] = sortino_factor
     df["Score Elite"] = df["Score Simples"] * df["Qualidade S/S"]
+    df["Score Sortino"] = df["Score Simples"] * df["Fator Sortino"]
     df["Score Curto Elite"] = df["Score Curto 5/20"] * df["Qualidade S/S"]
     df["Score"] = df["Score Elite"]
     df["MM20 Score"] = df["Score"].rolling(ma_window).mean()
@@ -430,6 +478,15 @@ def render_score_indicator(prices: pd.DataFrame, asset_col: str, benchmark_col: 
     ))
     fig.add_trace(go.Scatter(
         x=score_df.index,
+        y=score_df["Score Sortino"],
+        mode="lines",
+        name="Score Sortino puro",
+        line=dict(width=2, dash="dash"),
+        opacity=0.90,
+        yaxis="y",
+    ))
+    fig.add_trace(go.Scatter(
+        x=score_df.index,
         y=score_df["MM20 Score"],
         mode="lines",
         name="MM20 do Score Elite",
@@ -489,15 +546,16 @@ def render_score_indicator(prices: pd.DataFrame, asset_col: str, benchmark_col: 
     plotly_time_chart(fig, key=f"score_indicator_{asset_col}_{benchmark_col}")
 
     last = score_df.iloc[-1]
-    c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
+    c1, c2, c3, c4, c5, c6, c7, c8, c9 = st.columns(9)
     c1.metric("Score Simples", f"{last['Score Simples']:.2f}%" if pd.notna(last["Score Simples"]) else "n/d")
     c2.metric("Score Curto", f"{last['Score Curto 5/20']:.2f}%" if pd.notna(last["Score Curto 5/20"]) else "n/d")
     c3.metric("Fator Qualidade", f"{last['Qualidade S/S']:.2f}x" if pd.notna(last["Qualidade S/S"]) else "n/d")
-    c4.metric("Score Elite", f"{last['Score Elite']:.2f}%" if pd.notna(last["Score Elite"]) else "n/d")
-    c5.metric("Score Curto Elite", f"{last['Score Curto Elite']:.2f}%" if pd.notna(last["Score Curto Elite"]) else "n/d")
-    c6.metric("MM20 Elite", f"{last['MM20 Score']:.2f}%" if pd.notna(last["MM20 Score"]) else "n/d")
-    c7.metric("Condição", str(last["Condição"]))
-    c8.metric("Alerta PFR", str(last["Alerta PFR"]))
+    c4.metric("Fator Sortino", f"{last['Fator Sortino']:.2f}x" if pd.notna(last["Fator Sortino"]) else "n/d")
+    c5.metric("Score Elite", f"{last['Score Elite']:.2f}%" if pd.notna(last["Score Elite"]) else "n/d")
+    c6.metric("Score Sortino", f"{last['Score Sortino']:.2f}%" if pd.notna(last["Score Sortino"]) else "n/d")
+    c7.metric("MM20 Elite", f"{last['MM20 Score']:.2f}%" if pd.notna(last["MM20 Score"]) else "n/d")
+    c8.metric("Condição", str(last["Condição"]))
+    c9.metric("Alerta PFR", str(last["Alerta PFR"]))
 
     st.markdown(
         """
@@ -505,6 +563,7 @@ def render_score_indicator(prices: pd.DataFrame, asset_col: str, benchmark_col: 
 
 - **Score Simples**: força relativa pura do ativo contra o IBOV nas janelas selecionadas.
 - **Score Elite**: Score Simples ponderado pelo **Fator de Qualidade**, calculado com Sharpe 20d e Sortino 20d.
+- **Score Sortino puro**: Score Simples ponderado apenas pelo Sortino 20d; é uma leitura mais defensiva, focada em movimentos com menor volatilidade negativa.
 - **Score Curto 5/20**: versão tática do Score, usando somente 5 e 20 pregões; serve para timing e vira antes do Score completo.
 - **Score Curto Elite**: Score Curto 5/20 ponderado pelo mesmo Fator de Qualidade.
 - **MM20 do Score Elite**: média móvel de 20 pregões do Score Elite; ajuda a identificar consistência ou perda de força.
@@ -514,6 +573,7 @@ def render_score_indicator(prices: pd.DataFrame, asset_col: str, benchmark_col: 
 
 Quando o **Score Elite** está acima de zero e acima da MM20, o ativo está em liderança relativa com melhor qualidade de retorno.
 Quando o **Score Simples** sobe, mas o **Score Elite** não acompanha, o ativo pode estar subindo com pior relação retorno/risco.
+Quando o **Score Sortino** fica acima do Score Elite ou se mantém positivo, a força relativa tem melhor qualidade defensiva; quando fica muito abaixo, o movimento pode estar sofrendo com quedas fortes.
 Quando o **Score Curto** melhora antes do **Score Elite**, pode ser sinal inicial de rotação positiva; quando piora com Score Elite ainda positivo, pode indicar pullback ou perda tática de força.
         """
     )
@@ -681,7 +741,9 @@ O **Score** é uma média ponderada da performance relativa do ativo contra o be
 | **Sharpe 20d** | Retorno médio excedente / volatilidade total dos retornos | Mede consistência do retorno em relação à volatilidade total. |
 | **Sortino 20d** | Retorno médio excedente / volatilidade negativa | Mede qualidade do retorno penalizando mais as quedas. |
 | **Fator de Qualidade** | `1 + ((0,6 × Sharpe 20d + 0,4 × Sortino 20d) / 2)` limitado entre `0,25x` e `2,00x` | Aumenta ou reduz o Score conforme a qualidade do movimento. |
+| **Fator Sortino** | `1 + (Sortino 20d / 2)` limitado entre `0,25x` e `2,00x` | Ajusta o Score usando apenas risco negativo. |
 | **Score Elite** | `Score Simples × Fator de Qualidade` | Score final do ranking, combinando força relativa com qualidade de retorno. |
+| **Score Sortino** | `Score Simples × Fator Sortino` | Versão mais defensiva do score, ideal para filtrar ativos mais adequados a swing/carrego com opções. |
 | **Score Curto Elite** | `Score Curto 5/20 × Fator de Qualidade` | Versão tática ajustada por Sharpe + Sortino. |
 
 **Score simples:**
@@ -691,6 +753,10 @@ O **Score** é uma média ponderada da performance relativa do ativo contra o be
 **Score ELITE:**
 
 `Score Elite = Score Simples × Fator de Qualidade`
+
+**Score Sortino:**
+
+`Score Sortino = Score Simples × Fator Sortino`
 
 **Score Curto 5/20:**
 
@@ -718,6 +784,7 @@ Quando nem todas as janelas estão selecionadas ou disponíveis, o app recalibra
 
 - **Score Simples positivo:** ativo está performando melhor que o benchmark no conjunto das janelas.
 - **Score Elite:** mantém a força relativa, mas dá mais peso aos ativos com melhor relação retorno/risco.
+- **Score Sortino:** filtra ativos cuja força relativa veio com menor volatilidade negativa.
 - **Sharpe 20d:** mede retorno médio por volatilidade total.
 - **Sortino 20d:** mede retorno médio por volatilidade negativa (quedas).
 - **Score negativo:** ativo está performando pior que o benchmark.
@@ -835,6 +902,8 @@ def build_multi_benchmark_summary(asset_prices: pd.DataFrame, benchmark_prices: 
                 "Score Elite": row.get("Score Elite"),
                 "Score Simples": row.get("Score Simples"),
                 "Score Curto Elite": row.get("Score Curto Elite"),
+                "Score Sortino": row.get("Score Sortino"),
+                "Qualidade Premium": row.get("Qualidade Premium"),
                 "Sinal Curto": row.get("Sinal Curto"),
                 "Sharpe 20d": row.get("Sharpe 20d"),
                 "Sortino 20d": row.get("Sortino 20d"),
@@ -892,7 +961,7 @@ def render_table(df: pd.DataFrame, title: str, show_score_explanation: bool = Fa
     st.dataframe(styled, width="stretch", height=520)
 
 st.title("Força Relativa B3 x Benchmarks")
-st.caption("Ranking de ativos e índices setoriais por performance relativa contra IBOV, SPX, NASDAQ, DXY ou benchmark personalizado.")
+st.caption("Ranking de ativos e índices setoriais por performance relativa contra IBOV, SPX, NASDAQ, DXY ou benchmark personalizado, com Score Elite e Score Sortino puro.")
 
 with st.sidebar:
     st.header("Configuração")
@@ -1068,6 +1137,28 @@ try:
                 title=f"Top ativos por Score relativo contra {benchmark_label}",
             )
             st.plotly_chart(fig, width="stretch")
+
+            if "Score Sortino" in ranking.columns:
+                sortino_rank = ranking.dropna(subset=["Score Sortino"]).sort_values("Score Sortino", ascending=False).head(top_n)
+                if not sortino_rank.empty:
+                    fig_sortino = px.bar(
+                        sortino_rank,
+                        x="Ativo",
+                        y="Score Sortino",
+                        color="Qualidade Premium" if "Qualidade Premium" in sortino_rank.columns else "Regime",
+                        color_discrete_map={
+                            "Premium Sortino": "#004D40",
+                            "Qualidade positiva": "#2E7D32",
+                            "Força com risco": "#F28E2B",
+                            "Sem confirmação": "#B0B0B0",
+                            **REGIME_COLOR_MAP,
+                        },
+                        title=f"Top ativos por Score Sortino puro contra {benchmark_label}",
+                    )
+                    st.plotly_chart(fig_sortino, width="stretch")
+                    st.caption(
+                        "Score Sortino puro = Score Simples × Fator Sortino. Ele favorece ativos cuja força relativa veio com menor volatilidade negativa, útil para swing e carrego com opções."
+                    )
 
     with tab2:
         if sector_used_tickers:

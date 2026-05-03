@@ -102,3 +102,23 @@ Na aba **Indicador Score**, os alertas relevantes aparecem como marcadores trian
 - SPX → `^SPX`
 - NASDAQ → `^IXIC`
 - DXY (Dollar Index) → `DX-Y.NYB`
+
+## Atualização — Score Sortino puro
+
+Esta versão adiciona o **Score Sortino puro**:
+
+`Score Sortino = Score Simples × Fator Sortino`
+
+Onde:
+
+`Fator Sortino = 1 + (Sortino 20d / 2)`, limitado entre `0,25x` e `2,00x`.
+
+O objetivo é criar uma leitura mais defensiva da força relativa, favorecendo ativos que performam bem contra o benchmark com menor volatilidade negativa. Isso é especialmente útil para swing trade e carrego um pouco mais longo com opções.
+
+O app agora inclui:
+
+- coluna **Fator Sortino**;
+- coluna **Score Sortino**;
+- coluna **Qualidade Premium**;
+- gráfico adicional de Top Ativos por Score Sortino;
+- linha **Score Sortino puro** no gráfico do Indicador Score.
