@@ -46,6 +46,19 @@ BENCHMARK_OPTIONS = {
 
 MULTI_BENCHMARK_OPTIONS = BENCHMARK_OPTIONS.copy()
 
+# ── BRAPI — fonte alternativa para índices setoriais B3 ───────────────────────
+# O Yahoo Finance não disponibiliza séries históricas confiáveis para os índices
+# setoriais da B3 (IFNC, IMAT, ICON, IMOB, UTIL). O BRAPI (brapi.dev) é uma API
+# gratuita, sem necessidade de API key, específica para o mercado brasileiro.
+BRAPI_BASE_URL = "https://brapi.dev/api/quote"
+BRAPI_SECTOR_MAP: Dict[str, str] = {
+    "IFNC.SA": "IFNC",
+    "IMAT.SA": "IMAT",
+    "ICON.SA": "ICON",
+    "UTIL.SA": "UTIL",
+    "IMOB.SA": "IMOB",
+}
+
 # Pesos do Score Simples por janela.
 # Somam exatamente 1,00. Quando uma janela não está disponível, o Score é
 # renormalizado automaticamente pela divisão por used_weight.
@@ -63,6 +76,11 @@ SHORT_SCORE_WEIGHTS: Dict[int, float] = {5: 0.30, 20: 0.70}  # soma = 1.00
 # Gaps acima de GAP_WARN_THRESHOLD geram aviso na interface.
 FFILL_LIMIT: int = 3
 GAP_WARN_THRESHOLD: int = 3
+
+# Proporção mínima de dias com dado válido para um ticker ser considerado utilizável.
+# Tickers abaixo desse limiar (ex.: índices setoriais sem suporte no Yahoo Finance)
+# são movidos para a lista de falhas em vez de entrar no DataFrame quase vazio.
+MIN_VALID_RATIO: float = 0.30
 
 
 # ── Utilitários gerais ────────────────────────────────────────────────────────
@@ -154,6 +172,48 @@ def _detect_max_consecutive_gap(series: pd.Series) -> int:
         else:
             current = 0
     return max_gap
+
+
+def _fetch_brapi_close(ticker: str, start: date, end: date) -> pd.Series:
+    """
+    Busca série histórica de fechamento via BRAPI (brapi.dev).
+
+    Gratuita e sem API key. Projetada para o mercado brasileiro —
+    suporta índices setoriais da B3 que o Yahoo Finance não cobre.
+    BRAPI tem limite de ~15 req/min no plano gratuito; como são apenas
+    5 índices setoriais, está bem dentro do limite.
+    """
+    days = (end - start).days
+    range_param = next(
+        (r for d, r in [(30, "1mo"), (90, "3mo"), (180, "6mo"), (365, "1y"), (730, "2y")] if days <= d),
+        "5y",
+    )
+    r = requests.get(
+        f"{BRAPI_BASE_URL}/{ticker}",
+        params={"range": range_param, "interval": "1d", "fundamental": "false", "dividends": "false"},
+        timeout=15,
+    )
+    r.raise_for_status()
+    data = r.json()
+
+    results = data.get("results", [])
+    if not results:
+        return pd.Series(dtype=float)
+    hist = results[0].get("historicalDataPrice", [])
+    if not hist:
+        return pd.Series(dtype=float)
+
+    df = pd.DataFrame(hist)
+    if "date" not in df.columns or "close" not in df.columns:
+        return pd.Series(dtype=float)
+
+    # BRAPI retorna timestamps Unix em segundos; normaliza para datas sem horário
+    df["date"] = pd.to_datetime(df["date"], unit="s").dt.normalize()
+    df = df.set_index("date").sort_index()
+
+    close = df["close"].dropna()
+    mask = (close.index >= pd.Timestamp(start)) & (close.index <= pd.Timestamp(end))
+    return close[mask]
 
 
 # ── Download de preços ────────────────────────────────────────────────────────
@@ -261,16 +321,46 @@ def download_prices(
             except Exception:
                 continue
 
+    # ── Etapa 3: BRAPI para índices setoriais B3 sem suporte no Yahoo Finance ─
+    # Acionada apenas para tickers mapeados em BRAPI_SECTOR_MAP que ainda
+    # não foram resolvidos nas etapas anteriores.
+    still_after_yahoo = [tk for tk in tickers_list if tk not in frames]
+    for original in still_after_yahoo:
+        brapi_ticker = BRAPI_SECTOR_MAP.get(original)
+        if not brapi_ticker:
+            continue
+        try:
+            series = _fetch_brapi_close(brapi_ticker, start, end)
+            if not series.dropna().empty:
+                frames[original] = series.rename(original)
+                used_map[original] = f"BRAPI/{brapi_ticker}"
+        except Exception:
+            continue
+
     failed = [tk for tk in tickers_list if tk not in frames]
 
     if not frames:
         return pd.DataFrame(), used_map, failed, {}
 
-    # ── Detecção de gaps antes do ffill ───────────────────────────────────────
+    # ── Montar DataFrame bruto ────────────────────────────────────────────────
     raw_close = pd.concat(list(frames.values()), axis=1)
     raw_close.columns = [s.name for s in frames.values()]
     raw_close = raw_close.dropna(how="all")
 
+    # ── Filtro de qualidade mínima ────────────────────────────────────────────
+    # Tickers com menos de MIN_VALID_RATIO de dias válidos (ex.: índices setoriais
+    # que o Yahoo Finance não suporta de verdade) são tratados como falha em vez
+    # de entrar no DataFrame quase vazio e gerar avisos de gap enganosos.
+    if len(raw_close) > 0:
+        valid_ratio = raw_close.notna().mean()
+        low_quality = valid_ratio[valid_ratio < MIN_VALID_RATIO].index.tolist()
+        if low_quality:
+            raw_close = raw_close.drop(columns=low_quality)
+            for col in low_quality:
+                used_map.pop(col, None)
+            failed = failed + low_quality
+
+    # ── Detecção de gaps antes do ffill ───────────────────────────────────────
     gap_warnings: Dict[str, int] = {}
     for col in raw_close.columns:
         g = _detect_max_consecutive_gap(raw_close[col])
@@ -1208,7 +1298,11 @@ try:
         if sector_failed_tickers:
             missing = [t for t in sector_failed_tickers if t != benchmark]
             if missing:
-                st.warning("Sem dados para: " + ", ".join(missing) + ". Ignorados no ranking setorial.")
+                st.warning(
+                    "Índices sem dados mesmo após tentativas no Yahoo Finance e no BRAPI: **"
+                    + ", ".join(yahoo_to_br(t) for t in missing)
+                    + "**. Verifique sua conexão ou tente novamente mais tarde."
+                )
         if not sector_ranking.empty:
             cols = ["Índice"] + [c for c in sector_ranking.columns if c != "Índice"]
             render_table(
