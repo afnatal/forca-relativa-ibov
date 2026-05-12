@@ -46,10 +46,28 @@ BENCHMARK_OPTIONS = {
 
 MULTI_BENCHMARK_OPTIONS = BENCHMARK_OPTIONS.copy()
 
-SHORT_SCORE_WEIGHTS = {5: 0.30, 20: 0.70}
+# Pesos do Score Simples por janela.
+# Somam exatamente 1,00. Quando uma janela não está disponível, o Score é
+# renormalizado automaticamente pela divisão por used_weight.
+SCORE_WEIGHTS: Dict[int, float] = {
+    5: 0.10,
+    20: 0.25,
+    60: 0.30,
+    120: 0.25,
+    252: 0.10,
+}  # soma = 1.00
+
+SHORT_SCORE_WEIGHTS: Dict[int, float] = {5: 0.30, 20: 0.70}  # soma = 1.00
+
+# Limite máximo de dias consecutivos que o ffill pode propagar um preço.
+# Gaps acima de GAP_WARN_THRESHOLD geram aviso na interface.
+FFILL_LIMIT: int = 3
+GAP_WARN_THRESHOLD: int = 3
 
 
-def classify_short_signal(score_elite, score_short):
+# ── Utilitários gerais ────────────────────────────────────────────────────────
+
+def classify_short_signal(score_elite: float, score_short: float) -> str:
     """Classifica a leitura tática do Score Curto contra o Score Elite estrutural."""
     if pd.isna(score_elite) or pd.isna(score_short):
         return "Sem dados"
@@ -78,7 +96,10 @@ FALLBACK_IBOV = [
 
 
 def to_b3_payload(index: str, page: int = 1, page_size: int = 200) -> str:
-    data = {"language": "pt-br", "pageNumber": page, "pageSize": page_size, "index": index.upper(), "segment": "1"}
+    data = {
+        "language": "pt-br", "pageNumber": page,
+        "pageSize": page_size, "index": index.upper(), "segment": "1",
+    }
     raw = json.dumps(data, separators=(",", ":")).encode("utf-8")
     return base64.b64encode(raw).decode("utf-8")
 
@@ -122,28 +143,106 @@ def yahoo_to_br(ticker: str) -> str:
     return ticker.replace(".SA", "").replace("^", "")
 
 
+def _detect_max_consecutive_gap(series: pd.Series) -> int:
+    """Retorna o maior número de NaN consecutivos em uma série."""
+    max_gap = current = 0
+    for v in series.isna():
+        if v:
+            current += 1
+            if current > max_gap:
+                max_gap = current
+        else:
+            current = 0
+    return max_gap
+
+
+# ── Download de preços ────────────────────────────────────────────────────────
+
 @st.cache_data(ttl=60 * 30)
-def download_prices(tickers: Tuple[str, ...], start: date, end: date) -> Tuple[pd.DataFrame, Dict[str, str], List[str]]:
+def download_prices(
+    tickers: Tuple[str, ...],
+    start: date,
+    end: date,
+) -> Tuple[pd.DataFrame, Dict[str, str], List[str], Dict[str, int]]:
+    """
+    Baixa preços de fechamento ajustados para os tickers fornecidos.
+
+    Estratégia de download (duas etapas):
+    1. Download em lote com threads=True — rápido para carteiras grandes (~70 tickers).
+    2. Para falhas, tenta aliases individualmente via YAHOO_TICKER_ALIASES.
+
+    Qualidade de dados:
+    - Detecta gaps (NaN consecutivos) antes do preenchimento.
+    - Aplica ffill(limit=FFILL_LIMIT) — no máximo FFILL_LIMIT dias propagados.
+    - Tickers com gap > GAP_WARN_THRESHOLD são retornados em gap_warnings.
+
+    Returns:
+        prices_df    : DataFrame de fechamentos alinhados no índice de datas.
+        used_map     : {ticker_solicitado: ticker_efetivamente_usado}.
+        failed_list  : Tickers para os quais nenhum dado foi obtido.
+        gap_warnings : {ticker: max_gap_dias} para exibição de avisos na UI.
+    """
     if not tickers:
-        return pd.DataFrame(), {}, []
-    frames = []
+        return pd.DataFrame(), {}, [], {}
+
+    tickers_list = [str(t).strip() for t in tickers if str(t).strip()]
+    start_str = start.isoformat()
+    end_str = (end + timedelta(days=1)).isoformat()
+
+    frames: Dict[str, pd.Series] = {}
     used_map: Dict[str, str] = {}
-    failed: List[str] = []
-    for original in tickers:
-        original = str(original).strip()
-        if not original:
-            continue
+
+    # ── Etapa 1: download em lote ─────────────────────────────────────────────
+    batch_ok: set = set()
+    try:
+        buf_out, buf_err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+            batch_data = yf.download(
+                tickers_list,
+                start=start_str,
+                end=end_str,
+                auto_adjust=True,
+                progress=False,
+                threads=True,
+            )
+
+        if batch_data is not None and not batch_data.empty:
+            if isinstance(batch_data.columns, pd.MultiIndex):
+                # Múltiplos tickers: colunas são (metric, ticker)
+                lvl0 = batch_data.columns.get_level_values(0)
+                if "Close" in lvl0:
+                    close_df = batch_data["Close"]
+                    for tk in tickers_list:
+                        if tk in close_df.columns:
+                            s = close_df[tk]
+                            if s.dropna().shape[0] > 0:
+                                frames[tk] = s.rename(tk)
+                                used_map[tk] = tk
+                                batch_ok.add(tk)
+            else:
+                # DataFrame plano — ocorre quando só 1 ticker é solicitado
+                if len(tickers_list) == 1 and "Close" in batch_data.columns:
+                    tk = tickers_list[0]
+                    s = batch_data["Close"]
+                    if s.dropna().shape[0] > 0:
+                        frames[tk] = s.rename(tk)
+                        used_map[tk] = tk
+                        batch_ok.add(tk)
+    except Exception:
+        pass  # falha silenciosa; etapa 2 tenta individualmente
+
+    # ── Etapa 2: aliases individuais para falhas do lote ─────────────────────
+    still_needed = [tk for tk in tickers_list if tk not in batch_ok]
+    for original in still_needed:
         candidates = YAHOO_TICKER_ALIASES.get(original, [original])
-        series = None
-        used = None
         for candidate in candidates:
             try:
                 buf_out, buf_err = io.StringIO(), io.StringIO()
                 with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
                     data = yf.download(
                         candidate,
-                        start=start.isoformat(),
-                        end=(end + timedelta(days=1)).isoformat(),
+                        start=start_str,
+                        end=end_str,
                         auto_adjust=True,
                         progress=False,
                         threads=False,
@@ -156,38 +255,55 @@ def download_prices(tickers: Tuple[str, ...], start: date, end: date) -> Tuple[p
                     close = data.get("Close")
                 if close is None or close.dropna().empty:
                     continue
-                series = close.rename(original)
-                used = candidate
+                frames[original] = close.rename(original)
+                used_map[original] = candidate
                 break
             except Exception:
                 continue
-        if series is not None:
-            frames.append(series)
-            used_map[original] = used or original
-        else:
-            failed.append(original)
+
+    failed = [tk for tk in tickers_list if tk not in frames]
+
     if not frames:
-        return pd.DataFrame(), used_map, failed
-    close = pd.concat(frames, axis=1).dropna(how="all").ffill()
-    return close, used_map, failed
+        return pd.DataFrame(), used_map, failed, {}
+
+    # ── Detecção de gaps antes do ffill ───────────────────────────────────────
+    raw_close = pd.concat(list(frames.values()), axis=1)
+    raw_close.columns = [s.name for s in frames.values()]
+    raw_close = raw_close.dropna(how="all")
+
+    gap_warnings: Dict[str, int] = {}
+    for col in raw_close.columns:
+        g = _detect_max_consecutive_gap(raw_close[col])
+        if g > GAP_WARN_THRESHOLD:
+            gap_warnings[col] = g
+
+    # ffill com limite — não propaga preços obsoletos além de FFILL_LIMIT dias
+    close = raw_close.ffill(limit=FFILL_LIMIT)
+    return close, used_map, failed, gap_warnings
 
 
+# ── Métricas de qualidade ─────────────────────────────────────────────────────
 
-def calc_quality_metrics(asset: pd.Series, rf_daily: float = 0.0, window: int = 20) -> Dict[str, float]:
-    """Calcula Sharpe, Sortino e fator de qualidade para ponderar o Score.
+def calc_quality_metrics(
+    asset: pd.Series,
+    rf_daily: float = 0.0,
+    window: int = 20,
+) -> Dict[str, float]:
+    """
+    Calcula Sharpe, Sortino e fatores de qualidade para ponderar o Score.
 
-    Usa retornos logarítmicos diários na janela de 20 pregões. Para ranking,
-    não anualiza, pois todos os ativos são comparados no mesmo horizonte.
+    Usa retornos logarítmicos diários na janela de `window` pregões.
+    Não anualiza — todos os ativos são comparados no mesmo horizonte.
+
+    rf_daily: taxa livre de risco diária (ex.: CDI diário equivalente).
+              O excesso de retorno em relação ao CDI é o que entra no Sharpe/Sortino,
+              evitando premiar ativos que apenas acompanham a taxa básica.
     """
     log_ret = np.log(asset / asset.shift(1)).dropna()
     recent = log_ret.tail(window)
-    if len(recent) < max(5, window // 2):
-        return {
-            "Sharpe 20d": np.nan,
-            "Sortino 20d": np.nan,
-            "Qualidade S/S": np.nan,
-            "Fator Sortino": np.nan,
-        }
+    min_obs = max(5, window // 2)
+    if len(recent) < min_obs:
+        return {"Sharpe 20d": np.nan, "Sortino 20d": np.nan, "Qualidade S/S": np.nan, "Fator Sortino": np.nan}
 
     excess = recent - rf_daily
     vol = excess.std(ddof=0)
@@ -196,6 +312,7 @@ def calc_quality_metrics(asset: pd.Series, rf_daily: float = 0.0, window: int = 
 
     sharpe = excess.mean() / vol if pd.notna(vol) and vol > 0 else np.nan
     sortino = excess.mean() / down_vol if pd.notna(down_vol) and down_vol > 0 else np.nan
+    # Se não houve dias negativos, usa Sharpe como proxy do Sortino
     if pd.isna(sortino) and pd.notna(sharpe):
         sortino = sharpe
 
@@ -210,38 +327,53 @@ def calc_quality_metrics(asset: pd.Series, rf_daily: float = 0.0, window: int = 
     }
 
 
-def rolling_quality_factor(asset: pd.Series, rf_daily: float = 0.0, window: int = 20) -> pd.Series:
-    """Série histórica do fator de qualidade baseado em Sharpe + Sortino."""
+def rolling_quality_factor(
+    asset: pd.Series,
+    rf_daily: float = 0.0,
+    window: int = 20,
+) -> pd.Series:
+    """
+    Série histórica do fator de qualidade (Sharpe + Sortino).
+
+    Usa min_periods consistente em todas as janelas rolling, evitando
+    assimetria entre Sharpe e Sortino nas primeiras observações do histórico.
+    """
+    min_p = max(5, window // 2)
     log_ret = np.log(asset / asset.shift(1))
     excess = log_ret - rf_daily
-    mean = excess.rolling(window).mean()
-    vol = excess.rolling(window).std(ddof=0)
+
+    mean = excess.rolling(window, min_periods=min_p).mean()
+    vol = excess.rolling(window, min_periods=min_p).std(ddof=0)
     sharpe = mean / vol.replace(0, np.nan)
 
     downside = excess.where(excess < 0)
-    down_vol = downside.rolling(window, min_periods=max(5, window // 2)).std(ddof=0)
+    down_vol = downside.rolling(window, min_periods=min_p).std(ddof=0)
     sortino = mean / down_vol.replace(0, np.nan)
-    sortino = sortino.fillna(sharpe)
+    sortino = sortino.fillna(sharpe)  # proxy quando não houve dias negativos
 
     quality_raw = 0.6 * sharpe + 0.4 * sortino
-    quality_factor = (1 + quality_raw / 2).clip(lower=0.25, upper=2.00)
-    return quality_factor
+    return (1 + quality_raw / 2).clip(lower=0.25, upper=2.00)
 
 
-def rolling_sortino_factor(asset: pd.Series, rf_daily: float = 0.0, window: int = 20) -> pd.Series:
-    """Série histórica do fator de qualidade baseado somente em Sortino.
-
-    Esse fator penaliza apenas volatilidade negativa, tornando o Score mais
-    defensivo e mais exigente para swing/carrego com opções.
+def rolling_sortino_factor(
+    asset: pd.Series,
+    rf_daily: float = 0.0,
+    window: int = 20,
+) -> pd.Series:
     """
+    Série histórica do fator de qualidade baseado somente em Sortino.
+
+    Penaliza apenas volatilidade negativa — leitura mais defensiva,
+    exigente para swing/carrego com opções.
+    """
+    min_p = max(5, window // 2)
     log_ret = np.log(asset / asset.shift(1))
     excess = log_ret - rf_daily
-    mean = excess.rolling(window).mean()
+    mean = excess.rolling(window, min_periods=min_p).mean()
     downside = excess.where(excess < 0)
-    down_vol = downside.rolling(window, min_periods=max(5, window // 2)).std(ddof=0)
+    down_vol = downside.rolling(window, min_periods=min_p).std(ddof=0)
     sortino = mean / down_vol.replace(0, np.nan)
-    sortino_factor = (1 + sortino / 2).clip(lower=0.25, upper=2.00)
-    return sortino_factor
+    return (1 + sortino / 2).clip(lower=0.25, upper=2.00)
 
 
 def classify_premium_quality(row: Dict) -> str:
@@ -258,14 +390,51 @@ def classify_premium_quality(row: Dict) -> str:
             return "Força com risco"
     return "Sem confirmação"
 
-def calc_metrics(prices: pd.DataFrame, benchmark: str, windows: List[int], ma_window: int = 20) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    prices = prices.dropna(how="all").ffill()
+
+# ── Regime ────────────────────────────────────────────────────────────────────
+
+def classify_regime(row: Dict) -> str:
+    r20 = row.get("Relativo 20d %", np.nan)
+    r60 = row.get("Relativo 60d %", np.nan)
+    rs_mm = row.get("RS x MM20 %", np.nan)
+    if pd.notna(r20) and pd.notna(r60) and pd.notna(rs_mm):
+        if r20 > 0 and r60 > 0 and rs_mm > 0:
+            return "Liderança relativa"
+        if r20 > 0 and r60 < 0 and rs_mm > 0:
+            return "Virando para cima"
+        if r20 < 0 and r60 > 0:
+            return "Perdendo força"
+        if r20 < 0 and r60 < 0 and rs_mm < 0:
+            return "Underperform"
+    return "Neutro"
+
+
+REGIME_COLOR_MAP = {
+    "Perdendo força": "#F28E2B",
+    "Virando para cima": "#8CD17D",
+    "Liderança relativa": "#006400",
+    "Underperform": "#D62728",
+    "Neutro": "#F1C40F",
+}
+
+
+# ── Cálculo de métricas e ranking ─────────────────────────────────────────────
+
+def calc_metrics(
+    prices: pd.DataFrame,
+    benchmark: str,
+    windows: List[int],
+    ma_window: int = 20,
+    rf_daily: float = 0.0,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    prices = prices.dropna(how="all").ffill(limit=FFILL_LIMIT)
     if benchmark not in prices.columns:
         raise ValueError(f"Benchmark {benchmark} não encontrado nos preços baixados.")
     bench = prices[benchmark]
     tickers = [c for c in prices.columns if c != benchmark]
     rows = []
     rs_curves = pd.DataFrame(index=prices.index)
+
     for tk in tickers:
         s = prices[tk].dropna()
         aligned = pd.concat([s, bench], axis=1, join="inner").dropna()
@@ -276,73 +445,91 @@ def calc_metrics(prices: pd.DataFrame, benchmark: str, windows: List[int], ma_wi
         rs = asset / bm
         rs_norm = rs / rs.iloc[0] * 100
         rs_curves[tk] = rs_norm.reindex(prices.index)
-        row = {"Ativo": yahoo_to_br(tk)}
+
+        row: Dict = {"Ativo": yahoo_to_br(tk)}
         score = 0.0
         short_score = 0.0
         short_used_weight = 0.0
-        rel_by_window = {}
-        weights = {5: 0.10, 20: 0.30, 60: 0.30, 120: 0.30, 252: 0.10}
         used_weight = 0.0
+
         for w in windows:
             if len(asset) > w:
                 ret_asset = asset.iloc[-1] / asset.iloc[-w - 1] - 1
                 ret_bench = bm.iloc[-1] / bm.iloc[-w - 1] - 1
                 rel = ret_asset - ret_bench
-                rel_by_window[w] = rel
                 row[f"Ativo {w}d %"] = ret_asset * 100
                 row[f"Benchmark {w}d %"] = ret_bench * 100
                 row[f"Relativo {w}d %"] = rel * 100
-                wt = weights.get(w, 1 / len(windows))
+                wt = SCORE_WEIGHTS.get(w, 1 / len(windows))
                 score += rel * wt
                 used_weight += wt
                 if w in SHORT_SCORE_WEIGHTS:
                     short_score += rel * SHORT_SCORE_WEIGHTS[w]
                     short_used_weight += SHORT_SCORE_WEIGHTS[w]
+
         rs_ma = rs.rolling(ma_window).mean()
         row["RS Atual"] = rs_norm.iloc[-1]
         row["RS x MM20 %"] = ((rs.iloc[-1] / rs_ma.iloc[-1] - 1) * 100) if len(rs_ma.dropna()) else np.nan
         row["Score Simples"] = (score / used_weight * 100) if used_weight else np.nan
         row["Score Curto 5/20"] = (short_score / short_used_weight * 100) if short_used_weight else np.nan
-        q = calc_quality_metrics(asset, rf_daily=0.0, window=20)
+
+        q = calc_quality_metrics(asset, rf_daily=rf_daily, window=20)
         row.update(q)
-        row["Score Elite"] = row["Score Simples"] * row["Qualidade S/S"] if pd.notna(row["Score Simples"]) and pd.notna(row["Qualidade S/S"]) else np.nan
-        row["Score Sortino"] = row["Score Simples"] * row["Fator Sortino"] if pd.notna(row["Score Simples"]) and pd.notna(row["Fator Sortino"]) else np.nan
-        row["Score Curto Elite"] = row["Score Curto 5/20"] * row["Qualidade S/S"] if pd.notna(row["Score Curto 5/20"]) and pd.notna(row["Qualidade S/S"]) else np.nan
+
+        row["Score Elite"] = (
+            row["Score Simples"] * row["Qualidade S/S"]
+            if pd.notna(row["Score Simples"]) and pd.notna(row["Qualidade S/S"])
+            else np.nan
+        )
+        row["Score Sortino"] = (
+            row["Score Simples"] * row["Fator Sortino"]
+            if pd.notna(row["Score Simples"]) and pd.notna(row["Fator Sortino"])
+            else np.nan
+        )
+        row["Score Curto Elite"] = (
+            row["Score Curto 5/20"] * row["Qualidade S/S"]
+            if pd.notna(row["Score Curto 5/20"]) and pd.notna(row["Qualidade S/S"])
+            else np.nan
+        )
         row["Qualidade Premium"] = classify_premium_quality(row)
         row["Sinal Curto"] = classify_short_signal(row["Score Elite"], row["Score Curto Elite"])
         row["Score"] = row["Score Elite"]
         row["Regime"] = classify_regime(row)
         rows.append(row)
+
     ranking = pd.DataFrame(rows).sort_values("Score Elite", ascending=False) if rows else pd.DataFrame()
     return ranking, rs_curves
 
 
-def calc_score_series(prices: pd.DataFrame, asset_col: str, benchmark_col: str, windows: List[int], ma_window: int = 20) -> pd.DataFrame:
+def calc_score_series(
+    prices: pd.DataFrame,
+    asset_col: str,
+    benchmark_col: str,
+    windows: List[int],
+    ma_window: int = 20,
+    rf_daily: float = 0.0,
+) -> pd.DataFrame:
     """Calcula a série histórica do Score Relativo para um ativo/índice contra o benchmark."""
     if asset_col not in prices.columns or benchmark_col not in prices.columns:
         return pd.DataFrame()
-    aligned = prices[[asset_col, benchmark_col]].dropna().ffill()
+    aligned = prices[[asset_col, benchmark_col]].dropna().ffill(limit=FFILL_LIMIT)
     if aligned.empty:
         return pd.DataFrame()
 
     asset = aligned[asset_col]
     bench = aligned[benchmark_col]
-    weights = {5: 0.10, 20: 0.30, 60: 0.30, 120: 0.30, 252: 0.10}
+
     score = pd.Series(0.0, index=aligned.index)
     total_weight = pd.Series(0.0, index=aligned.index)
-
     for w in windows:
         if w <= 0:
             continue
         rel = asset.pct_change(w) - bench.pct_change(w)
-        wt = weights.get(w, 1 / max(len(windows), 1))
+        wt = SCORE_WEIGHTS.get(w, 1 / max(len(windows), 1))
         score = score.add(rel.fillna(0) * wt, fill_value=0)
         total_weight = total_weight.add(rel.notna().astype(float) * wt, fill_value=0)
-
     score_pct = (score / total_weight.replace(0, np.nan)) * 100
 
-    # Score Curto 5/20: versão tática, voltada para timing de entrada/saída.
-    # Usa somente a força relativa de 5 e 20 pregões, com maior peso para 20d.
     short_score = pd.Series(0.0, index=aligned.index)
     short_total_weight = pd.Series(0.0, index=aligned.index)
     for w, wt in SHORT_SCORE_WEIGHTS.items():
@@ -351,8 +538,9 @@ def calc_score_series(prices: pd.DataFrame, asset_col: str, benchmark_col: str, 
         short_total_weight = short_total_weight.add(rel.notna().astype(float) * wt, fill_value=0)
     short_score_pct = (short_score / short_total_weight.replace(0, np.nan)) * 100
 
-    quality_factor = rolling_quality_factor(asset, rf_daily=0.0, window=20)
-    sortino_factor = rolling_sortino_factor(asset, rf_daily=0.0, window=20)
+    quality_factor = rolling_quality_factor(asset, rf_daily=rf_daily, window=20)
+    sortino_factor = rolling_sortino_factor(asset, rf_daily=rf_daily, window=20)
+
     df = pd.DataFrame(index=aligned.index)
     df["Score Simples"] = score_pct
     df["Score Curto 5/20"] = short_score_pct
@@ -381,18 +569,19 @@ def calc_score_series(prices: pd.DataFrame, asset_col: str, benchmark_col: str, 
     return df.dropna(subset=["Score"])
 
 
+# ── Helpers de UI ─────────────────────────────────────────────────────────────
+
 def enable_horizontal_zoom(fig: go.Figure, range_slider: bool = True) -> go.Figure:
-    """Ativa controles úteis para zoom/pan no eixo horizontal dos gráficos temporais."""
     fig.update_xaxes(
         rangeslider=dict(visible=range_slider),
         rangeselector=dict(
-            buttons=list([
+            buttons=[
                 dict(count=1, label="1m", step="month", stepmode="backward"),
                 dict(count=3, label="3m", step="month", stepmode="backward"),
                 dict(count=6, label="6m", step="month", stepmode="backward"),
                 dict(count=1, label="1a", step="year", stepmode="backward"),
                 dict(step="all", label="Tudo"),
-            ])
+            ]
         ),
         type="date",
     )
@@ -401,20 +590,51 @@ def enable_horizontal_zoom(fig: go.Figure, range_slider: bool = True) -> go.Figu
 
 
 def plotly_time_chart(fig: go.Figure, key: str):
-    """Renderiza gráfico Plotly com barra de ferramentas ativa para zoom horizontal."""
     st.plotly_chart(
-        fig,
-        width="stretch",
-        key=key,
-        config={
-            "scrollZoom": True,
-            "displayModeBar": True,
-        },
+        fig, width="stretch", key=key,
+        config={"scrollZoom": True, "displayModeBar": True},
     )
 
 
-def render_score_indicator(prices: pd.DataFrame, asset_col: str, benchmark_col: str, windows: List[int], title: str):
-    score_df = calc_score_series(prices, asset_col, benchmark_col, windows)
+def reorder_ranking_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or "Regime" not in df.columns:
+        return df
+    first_col = next((c for c in ["Ativo", "Ticker", "Índice"] if c in df.columns), None)
+    if first_col is None:
+        return df
+    preferred = [first_col, "Regime"]
+    return df[preferred + [c for c in df.columns if c not in preferred]]
+
+
+def parse_manual_list(text: str) -> List[str]:
+    tokens = text.replace(";", ",").replace("\n", ",").split(",")
+    return [t.strip().upper() for t in tokens if t.strip()]
+
+
+def render_gap_warnings(gap_warnings: Dict[str, int], label: str = ""):
+    """Exibe aviso na UI para tickers com gaps de dados acima do limite de ffill."""
+    if not gap_warnings:
+        return
+    prefix = f"[{label}] " if label else ""
+    linhas = [
+        f"- **{yahoo_to_br(tk)}**: {dias} dia(s) consecutivo(s) sem dado "
+        f"(ffill limitado a {FFILL_LIMIT} dias — dias além do limite ficam como NaN)"
+        for tk, dias in sorted(gap_warnings.items(), key=lambda x: -x[1])
+    ]
+    st.warning(f"{prefix}Gaps de preço detectados:\n" + "\n".join(linhas))
+
+
+# ── Indicador visual de Score ─────────────────────────────────────────────────
+
+def render_score_indicator(
+    prices: pd.DataFrame,
+    asset_col: str,
+    benchmark_col: str,
+    windows: List[int],
+    title: str,
+    rf_daily: float = 0.0,
+):
+    score_df = calc_score_series(prices, asset_col, benchmark_col, windows, rf_daily=rf_daily)
     if score_df.empty:
         st.warning("Sem dados suficientes para calcular o indicador visual de Score.")
         return
@@ -427,66 +647,39 @@ def render_score_indicator(prices: pd.DataFrame, asset_col: str, benchmark_col: 
         "Neutro": "#B0B0B0",
     }
     bar_colors = [color_map.get(c, "#B0B0B0") for c in score_df["Condição"]]
-
-    # O histograma usa o Score Elite porque ele é o score final do modelo.
-    # O gráfico foi mantido mais limpo: não exibe mais o Score Simples
-    # nem o Score Curto 5/20 puro, preservando o foco no Score Elite,
-    # no Score Curto Elite, na MM20 do Score Elite e no preço em eixo secundário.
-    # A linha de fechamento do ativo é plotada no eixo Y secundário para comparar
-    # a evolução do preço com a evolução da força relativa em cada dia.
-    close_series = prices[asset_col].reindex(score_df.index).dropna() if asset_col in prices.columns else pd.Series(dtype=float)
+    close_series = (
+        prices[asset_col].reindex(score_df.index).dropna()
+        if asset_col in prices.columns
+        else pd.Series(dtype=float)
+    )
 
     fig = go.Figure()
     fig.add_trace(go.Bar(
-        x=score_df.index,
-        y=score_df["Score Elite"],
-        name="Histograma Score Elite",
-        marker_color=bar_colors,
-        opacity=0.45,
-        hovertemplate="Data=%{x}<br>Score Elite=%{y:.2f}%<extra></extra>",
-        yaxis="y",
+        x=score_df.index, y=score_df["Score Elite"],
+        name="Histograma Score Elite", marker_color=bar_colors, opacity=0.45,
+        hovertemplate="Data=%{x}<br>Score Elite=%{y:.2f}%<extra></extra>", yaxis="y",
     ))
     fig.add_trace(go.Scatter(
-        x=score_df.index,
-        y=score_df["Score Curto Elite"],
-        mode="lines",
-        name="Score Curto Elite",
-        line=dict(width=2),
-        opacity=0.85,
+        x=score_df.index, y=score_df["Score Curto Elite"],
+        mode="lines", name="Score Curto Elite", line=dict(width=2), opacity=0.85,
     ))
     fig.add_trace(go.Scatter(
-        x=score_df.index,
-        y=score_df["Score Elite"],
-        mode="lines",
-        name="Score Elite (Sharpe + Sortino)",
-        line=dict(width=3),
+        x=score_df.index, y=score_df["Score Elite"],
+        mode="lines", name="Score Elite (Sharpe + Sortino)", line=dict(width=3),
     ))
     fig.add_trace(go.Scatter(
-        x=score_df.index,
-        y=score_df["Score Sortino"],
-        mode="lines",
-        name="Score Sortino puro",
-        line=dict(width=2, dash="dash"),
-        opacity=0.90,
-        yaxis="y",
+        x=score_df.index, y=score_df["Score Sortino"],
+        mode="lines", name="Score Sortino puro", line=dict(width=2, dash="dash"), opacity=0.90, yaxis="y",
     ))
     fig.add_trace(go.Scatter(
-        x=score_df.index,
-        y=score_df["MM20 Score"],
-        mode="lines",
-        name="MM20 do Score Elite",
-        line=dict(width=2, dash="dot"),
-        yaxis="y",
+        x=score_df.index, y=score_df["MM20 Score"],
+        mode="lines", name="MM20 do Score Elite", line=dict(width=2, dash="dot"), yaxis="y",
     ))
     if not close_series.empty:
         fig.add_trace(go.Scatter(
-            x=close_series.index,
-            y=close_series,
-            mode="lines",
-            name=f"Fechamento diário — {yahoo_to_br(asset_col)}",
-            line=dict(width=2),
-            opacity=0.85,
-            yaxis="y2",
+            x=close_series.index, y=close_series,
+            mode="lines", name=f"Fechamento diário — {yahoo_to_br(asset_col)}",
+            line=dict(width=2), opacity=0.85, yaxis="y2",
             hovertemplate="Data=%{x}<br>Fechamento=%{y:.2f}<extra></extra>",
         ))
 
@@ -496,98 +689,47 @@ def render_score_indicator(prices: pd.DataFrame, asset_col: str, benchmark_col: 
         yaxis=dict(title="Score relativo (%)", side="left"),
         yaxis2=dict(
             title=f"Preço de fechamento — {yahoo_to_br(asset_col)}",
-            overlaying="y",
-            side="right",
-            showgrid=False,
+            overlaying="y", side="right", showgrid=False,
         ),
-        xaxis_title="Data",
-        legend_title="Indicador",
-        hovermode="x unified",
-        height=650,
+        xaxis_title="Data", legend_title="Indicador", hovermode="x unified", height=650,
     )
     enable_horizontal_zoom(fig, range_slider=True)
     plotly_time_chart(fig, key=f"score_indicator_{asset_col}_{benchmark_col}")
 
     last = score_df.iloc[-1]
     c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
-    c1.metric("Score Simples", f"{last['Score Simples']:.2f}%" if pd.notna(last["Score Simples"]) else "n/d")
-    c2.metric("Score Curto", f"{last['Score Curto 5/20']:.2f}%" if pd.notna(last["Score Curto 5/20"]) else "n/d")
-    c3.metric("Fator Qualidade", f"{last['Qualidade S/S']:.2f}x" if pd.notna(last["Qualidade S/S"]) else "n/d")
-    c4.metric("Fator Sortino", f"{last['Fator Sortino']:.2f}x" if pd.notna(last["Fator Sortino"]) else "n/d")
-    c5.metric("Score Elite", f"{last['Score Elite']:.2f}%" if pd.notna(last["Score Elite"]) else "n/d")
-    c6.metric("Score Sortino", f"{last['Score Sortino']:.2f}%" if pd.notna(last["Score Sortino"]) else "n/d")
-    c7.metric("MM20 Elite", f"{last['MM20 Score']:.2f}%" if pd.notna(last["MM20 Score"]) else "n/d")
-    c8.metric("Condição", str(last["Condição"]))
+    c1.metric("Score Simples",  f"{last['Score Simples']:.2f}%"  if pd.notna(last["Score Simples"])  else "n/d")
+    c2.metric("Score Curto",    f"{last['Score Curto 5/20']:.2f}%" if pd.notna(last["Score Curto 5/20"]) else "n/d")
+    c3.metric("Fator Qualidade",f"{last['Qualidade S/S']:.2f}x"  if pd.notna(last["Qualidade S/S"])  else "n/d")
+    c4.metric("Fator Sortino",  f"{last['Fator Sortino']:.2f}x"  if pd.notna(last["Fator Sortino"])  else "n/d")
+    c5.metric("Score Elite",    f"{last['Score Elite']:.2f}%"    if pd.notna(last["Score Elite"])    else "n/d")
+    c6.metric("Score Sortino",  f"{last['Score Sortino']:.2f}%"  if pd.notna(last["Score Sortino"])  else "n/d")
+    c7.metric("MM20 Elite",     f"{last['MM20 Score']:.2f}%"     if pd.notna(last["MM20 Score"])     else "n/d")
+    c8.metric("Condição",       str(last["Condição"]))
 
     st.markdown(
         """
 **Como ler este gráfico:**
 
-- **Score Simples**: força relativa pura do ativo contra o IBOV nas janelas selecionadas.
-- **Score Elite**: Score Simples ponderado pelo **Fator de Qualidade**, calculado com Sharpe 20d e Sortino 20d.
-- **Score Sortino puro**: Score Simples ponderado apenas pelo Sortino 20d; é uma leitura mais defensiva, focada em movimentos com menor volatilidade negativa.
-- **Score Curto 5/20**: versão tática do Score, usando somente 5 e 20 pregões; serve para timing e vira antes do Score completo.
-- **Score Curto Elite**: Score Curto 5/20 ponderado pelo mesmo Fator de Qualidade.
-- **MM20 do Score Elite**: média móvel de 20 pregões do Score Elite; ajuda a identificar consistência ou perda de força.
-- **Histograma**: barras do Score Elite coloridas conforme o sinal e a direção do score.
-- **Fechamento diário**: preço de fechamento do ativo no eixo secundário à direita; permite comparar se o preço está confirmando, antecipando ou divergindo da força relativa.
+- **Score Simples**: força relativa pura do ativo contra o benchmark nas janelas selecionadas.
+- **Score Elite**: Score Simples × Fator de Qualidade (Sharpe + Sortino descontados pelo CDI).
+- **Score Sortino puro**: Score Simples × Fator Sortino; leitura mais defensiva, foco em risco de queda.
+- **Score Curto 5/20**: versão tática (5 e 20 pregões); antecipa viragens de curto prazo.
+- **Score Curto Elite**: Score Curto ponderado pelo Fator de Qualidade.
+- **MM20 do Score Elite**: média móvel de 20 pregões do Score Elite.
+- **Histograma**: barras do Score Elite coloridas conforme direção e sinal.
+- **Fechamento diário**: preço de fechamento no eixo secundário direito.
 
-Quando o **Score Elite** está acima de zero e acima da MM20, o ativo está em liderança relativa com melhor qualidade de retorno.
-Quando o **Score Simples** sobe, mas o **Score Elite** não acompanha, o ativo pode estar subindo com pior relação retorno/risco.
-Quando o **Score Sortino** fica acima do Score Elite ou se mantém positivo, a força relativa tem melhor qualidade defensiva; quando fica muito abaixo, o movimento pode estar sofrendo com quedas fortes.
-Quando o **Score Curto** melhora antes do **Score Elite**, pode ser sinal inicial de rotação positiva; quando piora com Score Elite ainda positivo, pode indicar pullback ou perda tática de força.
+Score Elite acima de zero e acima da MM20 indica liderança relativa com qualidade de retorno.
+Score Simples subindo sem o Score Elite acompanhar sugere força com pior relação retorno/risco.
+Score Curto melhorando antes do Elite pode sinalizar rotação positiva inicial.
         """
     )
 
 
-def classify_regime(row: Dict) -> str:
-    r20 = row.get("Relativo 20d %", np.nan)
-    r60 = row.get("Relativo 60d %", np.nan)
-    rs_mm = row.get("RS x MM20 %", np.nan)
-    if pd.notna(r20) and pd.notna(r60) and pd.notna(rs_mm):
-        if r20 > 0 and r60 > 0 and rs_mm > 0:
-            return "Liderança relativa"
-        if r20 > 0 and r60 < 0 and rs_mm > 0:
-            return "Virando para cima"
-        if r20 < 0 and r60 > 0:
-            return "Perdendo força"
-        if r20 < 0 and r60 < 0 and rs_mm < 0:
-            return "Underperform"
-    return "Neutro"
-
-
-
-REGIME_COLOR_MAP = {
-    "Perdendo força": "#F28E2B",      # laranja
-    "Virando para cima": "#8CD17D",   # verde claro
-    "Liderança relativa": "#006400",  # verde escuro
-    "Underperform": "#D62728",        # vermelho
-    "Neutro": "#F1C40F",              # amarelo
-}
-
-
-def reorder_ranking_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Coloca Regime como segunda coluna, logo após Ativo/Ticker/Índice, mantendo as demais colunas."""
-    if df.empty or "Regime" not in df.columns:
-        return df
-    first_col = None
-    for candidate in ["Ativo", "Ticker", "Índice"]:
-        if candidate in df.columns:
-            first_col = candidate
-            break
-    if first_col is None:
-        return df
-    preferred = [first_col, "Regime"]
-    ordered = preferred + [c for c in df.columns if c not in preferred]
-    return df[ordered]
-
-def parse_manual_list(text: str) -> List[str]:
-    tokens = text.replace(";", ",").replace("\n", ",").split(",")
-    return [t.strip().upper() for t in tokens if t.strip()]
-
+# ── Explicações ───────────────────────────────────────────────────────────────
 
 def render_score_explanation(context: str = "ranking"):
-    """Mostra uma explicação curta e consistente sobre o cálculo do Score."""
     with st.expander("Como o Score é calculado", expanded=False):
         st.markdown(
             """
@@ -595,156 +737,98 @@ O **Score** é uma média ponderada da performance relativa do ativo contra o be
 
 **Performance relativa de cada janela:**
 
-`Relativo Nd % = Retorno do ativo em N pregões - Retorno do benchmark em N pregões`
+`Relativo Nd % = Retorno do ativo em N pregões − Retorno do benchmark em N pregões`
 
-### Tipos de Score usados no app
-
-| Indicador | Cálculo | Para que serve |
-|---|---|---|
-| **Relativo Nd %** | `Retorno do ativo em N pregões - Retorno do benchmark em N pregões` | Mede se o ativo ganhou ou perdeu do IBOV em cada janela. |
-| **Score Simples** | Média ponderada dos retornos relativos disponíveis | Mede força relativa pura, sem ajuste de risco. |
-| **Score Curto 5/20** | `0,3 × RS 5d + 0,7 × RS 20d` | Mede momentum relativo tático para timing de entrada/saída. |
-| **Sharpe 20d** | Retorno médio excedente / volatilidade total dos retornos | Mede consistência do retorno em relação à volatilidade total. |
-| **Sortino 20d** | Retorno médio excedente / volatilidade negativa | Mede qualidade do retorno penalizando mais as quedas. |
-| **Fator de Qualidade** | `1 + ((0,6 × Sharpe 20d + 0,4 × Sortino 20d) / 2)` limitado entre `0,25x` e `2,00x` | Aumenta ou reduz o Score conforme a qualidade do movimento. |
-| **Fator Sortino** | `1 + (Sortino 20d / 2)` limitado entre `0,25x` e `2,00x` | Ajusta o Score usando apenas risco negativo. |
-| **Score Elite** | `Score Simples × Fator de Qualidade` | Score final do ranking, combinando força relativa com qualidade de retorno. |
-| **Score Sortino** | `Score Simples × Fator Sortino` | Versão mais defensiva do score, ideal para filtrar ativos mais adequados a swing/carrego com opções. |
-| **Score Curto Elite** | `Score Curto 5/20 × Fator de Qualidade` | Versão tática ajustada por Sharpe + Sortino. |
-
-**Score simples:**
-
-`Score Simples = média ponderada dos retornos relativos disponíveis`
-
-**Score ELITE:**
-
-`Score Elite = Score Simples × Fator de Qualidade`
-
-**Score Sortino:**
-
-`Score Sortino = Score Simples × Fator Sortino`
-
-**Score Curto 5/20:**
-
-`Score Curto = 0,3 × Relativo 5d + 0,7 × Relativo 20d`
-
-**Score Curto Elite:**
-
-`Score Curto Elite = Score Curto × Fator de Qualidade`
-
-**Fator de Qualidade:** calculado com 60% de Sharpe 20d e 40% de Sortino 20d. O fator é limitado entre 0,25 e 2,00 para evitar distorções por outliers.
-
-Pesos usados no projeto:
+### Pesos por janela (somam exatamente 1,00)
 
 | Janela | Peso |
 |---:|---:|
-| 5 pregões | 10% |
-| 20 pregões | 30% |
+| 5 pregões  | 10% |
+| 20 pregões | 25% |
 | 60 pregões | 30% |
-| 120 pregões | 30% |
+| 120 pregões | 25% |
 | 252 pregões | 10% |
 
-Quando nem todas as janelas estão selecionadas ou disponíveis, o app recalibra o Score usando apenas os pesos das janelas calculadas.
+Quando nem todas as janelas estão selecionadas ou disponíveis, o Score é renormalizado
+automaticamente pelos pesos das janelas calculadas.
 
-**Leitura prática:**
+### Tipos de Score
 
-- **Score Simples positivo:** ativo está performando melhor que o benchmark no conjunto das janelas.
-- **Score Elite:** mantém a força relativa, mas dá mais peso aos ativos com melhor relação retorno/risco.
-- **Score Sortino:** filtra ativos cuja força relativa veio com menor volatilidade negativa.
-- **Sharpe 20d:** mede retorno médio por volatilidade total.
-- **Sortino 20d:** mede retorno médio por volatilidade negativa (quedas).
-- **Score negativo:** ativo está performando pior que o benchmark.
-- **Score alto e consistente:** possível liderança relativa.
-- **Score caindo ou abaixo da MM20:** perda de força relativa.
-- **Score Curto positivo com Score Elite positivo:** timing favorável dentro de liderança.
-- **Score Curto negativo com Score Elite positivo:** possível pullback ou perda tática de força.
-- **Score Curto positivo com Score Elite negativo:** possível reversão inicial, ainda sem confirmação estrutural.
+| Indicador | Cálculo | Para que serve |
+|---|---|---|
+| **Score Simples** | Média ponderada dos retornos relativos | Força relativa pura, sem ajuste de risco. |
+| **Score Curto 5/20** | `0,30 × RS5d + 0,70 × RS20d` | Momentum tático para timing de entrada/saída. |
+| **Sharpe 20d** | Excesso sobre CDI / σ total (20d) | Consistência relativa à volatilidade total. |
+| **Sortino 20d** | Excesso sobre CDI / σ negativa (20d) | Qualidade penalizando mais as quedas. |
+| **Fator de Qualidade** | `clip(1 + (0,6·Sharpe + 0,4·Sortino)/2, 0,25, 2,00)` | Amplifica ou penaliza o Score conforme qualidade. |
+| **Fator Sortino** | `clip(1 + Sortino/2, 0,25, 2,00)` | Ajuste defensivo focado em risco de queda. |
+| **Score Elite** | `Score Simples × Fator de Qualidade` | Score final do ranking. |
+| **Score Sortino** | `Score Simples × Fator Sortino` | Versão defensiva, ideal para swing/carrego. |
+| **Score Curto Elite** | `Score Curto × Fator de Qualidade` | Timing ajustado por qualidade. |
+
+> **Taxa livre de risco (CDI):** Sharpe e Sortino calculam o excesso de retorno sobre
+> o CDI diário configurado na barra lateral. Ativos que apenas acompanham o CDI
+> não são premiados pelo Fator de Qualidade.
             """
         )
         if context == "indicator":
             st.info(
                 "Na aba Indicador Score, o mesmo cálculo é feito historicamente em cada data, "
-                "permitindo visualizar a evolução do Score, a MM20 do Score e o histograma de força/perda de força."
+                "permitindo visualizar a evolução do Score, a MM20 e o histograma."
             )
 
 
-
 def render_rs_explanation():
-    """Mostra uma explicação clara sobre a Linha RS (Relative Strength)."""
     with st.expander("Como a Linha RS é calculada", expanded=False):
         st.markdown(
             """
-A **Linha RS** mede a **força relativa do ativo contra o benchmark selecionado**.
-
-Ela mostra se o ativo está performando melhor ou pior do que o índice de comparação ao longo do tempo.
-
-### Cálculo bruto
+A **Linha RS** mede a **força relativa do ativo contra o benchmark** ao longo do tempo.
 
 `RS = Preço de fechamento do ativo / Preço de fechamento do benchmark`
 
-Exemplo: se o benchmark selecionado for o IBOV, a linha compara o ativo contra o IBOV dia a dia.
-
-### Normalização usada no app
-
-Para facilitar a leitura visual, o app transforma a linha para **base 100**:
+No app, a linha é normalizada em **base 100** para facilitar comparações visuais:
 
 `RS base 100 = (RS do dia / RS inicial do período) × 100`
 
-Assim, a linha começa próxima de 100 e fica mais fácil comparar vários ativos no mesmo gráfico.
-
-### Como interpretar
-
 | Movimento da Linha RS | Interpretação |
 |---|---|
-| **Linha RS subindo** | O ativo está performando melhor que o benchmark. |
-| **Linha RS caindo** | O ativo está performando pior que o benchmark. |
-| **Linha RS lateral** | O ativo está andando de forma parecida com o benchmark. |
-| **Linha RS acima da MM20** | Força relativa de curto prazo ainda favorável. |
-| **Linha RS abaixo da MM20** | Perda de tração relativa. |
+| Linha RS subindo | Ativo performando melhor que o benchmark |
+| Linha RS caindo | Ativo performando pior que o benchmark |
+| RS acima da MM20 | Força relativa de curto prazo ainda favorável |
+| RS abaixo da MM20 | Perda de tração relativa |
 
-### Diferença entre Linha RS e Score
-
-- **Linha RS**: mostra a evolução acumulada da força relativa no gráfico.
-- **Score**: transforma essa força relativa em um número ponderado por janelas, como 5d, 20d, 60d e 120d, podendo ainda ser ajustado por Sharpe e Sortino na versão ELITE.
-
-Em resumo: a **Linha RS mostra o caminho**; o **Score resume a condição atual em forma de ranking e regime**.
+A **Linha RS mostra o caminho**; o **Score resume a condição atual** em forma de ranking.
             """
         )
 
+
 def render_regime_explanation():
-    """Mostra os critérios usados para definir o regime de força relativa."""
     with st.expander("Critérios para definição do Regime", expanded=False):
         st.markdown(
             """
-O **Regime** resume a condição de força relativa do ativo/índice contra o benchmark selecionado.
-
-O app usa principalmente três informações:
-
-1. **Relativo 20d %**: retorno do ativo em 20 pregões menos o retorno do benchmark no mesmo período.
-2. **Relativo 60d %**: retorno do ativo em 60 pregões menos o retorno do benchmark no mesmo período.
-3. **RS x MM20 %**: distância da linha de força relativa `Ativo / IBOV` em relação à sua média móvel de 20 períodos.
-
-### Opções de regime
-
-| Regime | Critério usado | Interpretação prática |
+| Regime | Critério | Interpretação prática |
 |---|---|---|
-| **Liderança relativa** | Relativo 20d > 0, Relativo 60d > 0 e RS acima da MM20 | Força relativa sustentada contra o IBOV. |
-| **Virando para cima** | Relativo 20d > 0, Relativo 60d < 0 e RS acima da MM20 | Possível início de rotação positiva. |
-| **Perdendo força** | Relativo 20d < 0 e Relativo 60d > 0 | Ainda tem desempenho médio positivo, mas perdeu tração recente. |
-| **Underperform** | Relativo 20d < 0, Relativo 60d < 0 e RS abaixo da MM20 | Pior desempenho relativo e sem recuperação confirmada. |
-| **Neutro** | Critérios mistos ou dados insuficientes | Exige leitura complementar pelo gráfico, preço, volume e fluxo. |
+| **Liderança relativa** | Rel. 20d > 0, Rel. 60d > 0 e RS > MM20 | Força relativa sustentada. |
+| **Virando para cima** | Rel. 20d > 0, Rel. 60d < 0 e RS > MM20 | Possível início de rotação positiva. |
+| **Perdendo força** | Rel. 20d < 0 e Rel. 60d > 0 | Força média positiva, sem tração recente. |
+| **Underperform** | Rel. 20d < 0, Rel. 60d < 0 e RS < MM20 | Pior desempenho sem recuperação confirmada. |
+| **Neutro** | Critérios mistos ou dados insuficientes | Complementar com gráfico, volume e fluxo. |
 
-### Como usar
-
-- Para compras, priorize **Liderança relativa** ou **Virando para cima**, desde que o gráfico de preço confirme.
-- Para alerta de realização ou perda de tração, observe **Perdendo força**.
-- Para evitar compras direcionais, filtre ativos em **Underperform**.
+Para compras, priorize **Liderança relativa** ou **Virando para cima** com confirmação de preço.
+Para alerta de realização, observe **Perdendo força**. Evite compras direcionais em **Underperform**.
             """
         )
 
 
-def build_multi_benchmark_summary(asset_prices: pd.DataFrame, benchmark_prices: pd.DataFrame, windows: List[int]) -> pd.DataFrame:
-    """Cria resumo multi-benchmark usando o mesmo cálculo de Score Elite para cada benchmark fixo."""
+# ── Multi-benchmark ───────────────────────────────────────────────────────────
+
+def build_multi_benchmark_summary(
+    asset_prices: pd.DataFrame,
+    benchmark_prices: pd.DataFrame,
+    windows: List[int],
+    rf_daily: float = 0.0,
+) -> pd.DataFrame:
+    """Cria resumo multi-benchmark usando Score Elite para cada benchmark fixo."""
     rows = []
     if asset_prices.empty or benchmark_prices.empty:
         return pd.DataFrame()
@@ -752,9 +836,13 @@ def build_multi_benchmark_summary(asset_prices: pd.DataFrame, benchmark_prices: 
     for label, bench_ticker in MULTI_BENCHMARK_OPTIONS.items():
         if bench_ticker not in benchmark_prices.columns:
             continue
-        combined = pd.concat([asset_prices, benchmark_prices[[bench_ticker]]], axis=1).dropna(how="all").ffill()
+        combined = (
+            pd.concat([asset_prices, benchmark_prices[[bench_ticker]]], axis=1)
+            .dropna(how="all")
+            .ffill(limit=FFILL_LIMIT)
+        )
         try:
-            rank, _ = calc_metrics(combined, bench_ticker, windows)
+            rank, _ = calc_metrics(combined, bench_ticker, windows, rf_daily=rf_daily)
         except Exception:
             continue
         if rank.empty:
@@ -777,6 +865,7 @@ def build_multi_benchmark_summary(asset_prices: pd.DataFrame, benchmark_prices: 
                 "Relativo 60d %": row.get("Relativo 60d %"),
                 "RS x MM20 %": row.get("RS x MM20 %"),
             })
+
     out = pd.DataFrame(rows)
     if out.empty:
         return out
@@ -787,7 +876,9 @@ def build_multi_benchmark_summary(asset_prices: pd.DataFrame, benchmark_prices: 
     summary["Score Multi-Benchmark"] = summary[bench_cols].mean(axis=1, skipna=True)
     summary["Benchmarks positivos"] = (summary[bench_cols] > 0).sum(axis=1)
     summary["Total benchmarks"] = summary[bench_cols].notna().sum(axis=1)
-    summary["Consistência"] = summary["Benchmarks positivos"].astype(str) + "/" + summary["Total benchmarks"].astype(str)
+    summary["Consistência"] = (
+        summary["Benchmarks positivos"].astype(str) + "/" + summary["Total benchmarks"].astype(str)
+    )
 
     def classify_multi(row):
         score = row.get("Score Multi-Benchmark", np.nan)
@@ -810,7 +901,12 @@ def build_multi_benchmark_summary(asset_prices: pd.DataFrame, benchmark_prices: 
     return summary[ordered].sort_values("Score Multi-Benchmark", ascending=False)
 
 
-def render_table(df: pd.DataFrame, title: str, show_score_explanation: bool = False, show_regime_explanation: bool = False):
+def render_table(
+    df: pd.DataFrame,
+    title: str,
+    show_score_explanation: bool = False,
+    show_regime_explanation: bool = False,
+):
     st.subheader(title)
     if show_score_explanation:
         render_score_explanation(context="ranking")
@@ -824,28 +920,58 @@ def render_table(df: pd.DataFrame, title: str, show_score_explanation: bool = Fa
     styled = df.style.format({c: "{:.2f}" for c in numeric_cols})
     st.dataframe(styled, width="stretch", height=520)
 
+
+# ── Interface principal ───────────────────────────────────────────────────────
+
 st.title("Força Relativa B3 x Benchmarks")
-st.caption("Ranking de ativos e índices setoriais por performance relativa contra IBOV, SPX, NASDAQ, DXY ou benchmark personalizado, com Score Elite e Score Sortino puro.")
+st.caption(
+    "Ranking de ativos e índices setoriais por performance relativa contra IBOV, SPX, NASDAQ, DXY ou benchmark "
+    "personalizado. Score Elite com Sharpe + Sortino descontados pelo CDI configurável na barra lateral."
+)
 
 with st.sidebar:
     st.header("Configuração")
-    source_mode = st.radio("Universo de ativos", ["Carteira IBOV automática B3", "Lista manual", "Upload CSV"], index=0)
+
+    source_mode = st.radio(
+        "Universo de ativos",
+        ["Carteira IBOV automática B3", "Lista manual", "Upload CSV"],
+        index=0,
+    )
 
     st.subheader("Benchmark")
     benchmark_choice = st.selectbox(
         "Benchmark padrão",
         list(BENCHMARK_OPTIONS.keys()),
         index=0,
-        help="Selecione um benchmark padrão. O app usará automaticamente o ticker correspondente no Yahoo Finance.",
+        help="Selecione o benchmark principal de comparação.",
     )
     custom_benchmark = st.text_input(
         "Benchmark personalizado opcional",
         value="",
         placeholder="Ex.: ^RUT, SPY, EWZ, BOVA11.SA",
-        help="Preencha somente se quiser substituir o benchmark padrão selecionado acima.",
+        help="Preencha apenas se quiser substituir o benchmark padrão acima.",
     )
     benchmark_input = custom_benchmark.strip() or BENCHMARK_OPTIONS[benchmark_choice]
-    st.caption(f"Benchmark em uso: **{benchmark_choice if not custom_benchmark.strip() else 'Personalizado'}** → `{benchmark_input}`")
+    st.caption(
+        f"Benchmark em uso: **{benchmark_choice if not custom_benchmark.strip() else 'Personalizado'}** → `{benchmark_input}`"
+    )
+
+    # ── Taxa livre de risco ───────────────────────────────────────────────────
+    st.subheader("Taxa livre de risco")
+    cdi_annual = st.number_input(
+        "CDI / Selic anual (%)",
+        min_value=0.0,
+        max_value=30.0,
+        value=10.75,
+        step=0.25,
+        help=(
+            "Taxa usada no cálculo de Sharpe e Sortino (excesso de retorno sobre o CDI). "
+            "Defina 0,0 para ignorar o custo de oportunidade. "
+            "Padrão: ~10,75% (Selic atual aproximada)."
+        ),
+    )
+    rf_daily = (1 + cdi_annual / 100) ** (1 / 252) - 1
+    st.caption(f"Taxa diária equivalente: `{rf_daily * 100:.4f}%`")
 
     start = st.date_input("Data inicial", value=date.today() - timedelta(days=370))
     end = st.date_input("Data final", value=date.today())
@@ -865,12 +991,16 @@ with st.sidebar:
         sector_text = st.text_area(
             "Tickers dos índices setoriais no Yahoo",
             value="\n".join([f"{name},{ticker}" for name, ticker in SECTOR_INDICES.items()]),
-            help="Formato: Nome do índice,ticker Yahoo. Mantenha somente os cinco índices definidos: IFNC, IMAT, ICON, UTIL e IMOB.",
+            help="Formato: Nome do índice,ticker Yahoo. Mantenha os cinco índices: IFNC, IMAT, ICON, UTIL e IMOB.",
             height=150,
         )
     else:
         sector_text = "\n".join([f"{name},{ticker}" for name, ticker in SECTOR_INDICES.items()])
-        st.dataframe(pd.DataFrame([{"Índice": name, "Ticker Yahoo": ticker} for name, ticker in SECTOR_INDICES.items()]), width="stretch", hide_index=True)
+        st.dataframe(
+            pd.DataFrame([{"Índice": name, "Ticker Yahoo": ticker} for name, ticker in SECTOR_INDICES.items()]),
+            width="stretch",
+            hide_index=True,
+        )
 
     run = st.button("Atualizar análise", type="primary")
 
@@ -879,12 +1009,12 @@ def resolve_tickers(source_mode: str, manual_text: str, uploaded_file) -> List[s
     if source_mode == "Carteira IBOV automática B3":
         try:
             ibov_df = fetch_b3_index_portfolio("IBOV")
-            tickers = ibov_df["ticker"].tolist() if not ibov_df.empty else FALLBACK_IBOV
             if ibov_df.empty:
-                st.warning("Não consegui ler a carteira da B3. Usei a lista fallback editável no código.")
-            return tickers
+                st.warning("Não consegui ler a carteira da B3. Usando lista fallback.")
+                return FALLBACK_IBOV
+            return ibov_df["ticker"].tolist()
         except Exception as e:
-            st.warning(f"Falha ao buscar carteira automática da B3: {e}. Usei fallback local.")
+            st.warning(f"Falha ao buscar carteira automática da B3: {e}. Usando fallback local.")
             return FALLBACK_IBOV
     if source_mode == "Lista manual":
         return parse_manual_list(manual_text)
@@ -897,17 +1027,19 @@ def resolve_tickers(source_mode: str, manual_text: str, uploaded_file) -> List[s
 
 
 def parse_sector_tickers(sector_text: str) -> Dict[str, str]:
-    allowed_sector_codes = {"IFNC", "IMAT", "ICON", "UTIL", "IMOB"}
-    sector_tickers = {}
+    allowed = {"IFNC", "IMAT", "ICON", "UTIL", "IMOB"}
+    out: Dict[str, str] = {}
     for line in sector_text.splitlines():
         if not line.strip() or "," not in line:
             continue
         name, tk = line.split(",", 1)
         code = name.strip().split(" - ")[0].upper()
-        if code in allowed_sector_codes:
-            sector_tickers[name.strip()] = tk.strip()
-    return sector_tickers
+        if code in allowed:
+            out[name.strip()] = tk.strip()
+    return out
 
+
+# ── Estado da sessão e execução ───────────────────────────────────────────────
 
 if "analysis_ready" not in st.session_state:
     st.session_state.analysis_ready = False
@@ -917,24 +1049,44 @@ if run:
         benchmark = benchmark_input.strip()
         benchmark_label = benchmark_choice if not custom_benchmark.strip() else f"Personalizado ({benchmark})"
         windows = windows_input
+
         tickers_br = resolve_tickers(source_mode, manual_text, uploaded)
         if not tickers_br:
             st.stop()
 
         asset_yahoo = br_to_yahoo(tickers_br)
         all_asset_tickers = tuple(sorted(set(asset_yahoo + [benchmark])))
-        prices, used_tickers, failed_tickers = download_prices(all_asset_tickers, start, end)
-        ranking, rs_curves = calc_metrics(prices, benchmark, windows)
+
+        with st.spinner("Baixando preços em lote…"):
+            prices, used_tickers, failed_tickers, gap_warnings = download_prices(
+                all_asset_tickers, start, end
+            )
+
+        with st.spinner("Calculando scores e rankings…"):
+            ranking, rs_curves = calc_metrics(prices, benchmark, windows, rf_daily=rf_daily)
 
         fixed_benchmark_tickers = tuple(sorted(set(MULTI_BENCHMARK_OPTIONS.values())))
-        multi_benchmark_prices, multi_benchmark_used, multi_benchmark_failed = download_prices(fixed_benchmark_tickers, start, end)
-        asset_only_prices = prices[[c for c in prices.columns if c in asset_yahoo]].copy() if not prices.empty else pd.DataFrame()
-        multi_benchmark_summary = build_multi_benchmark_summary(asset_only_prices, multi_benchmark_prices, windows)
+        with st.spinner("Baixando benchmarks fixos (multi-benchmark)…"):
+            multi_benchmark_prices, multi_benchmark_used, multi_benchmark_failed, multi_benchmark_gaps = (
+                download_prices(fixed_benchmark_tickers, start, end)
+            )
+
+        asset_only_prices = (
+            prices[[c for c in prices.columns if c in asset_yahoo]].copy()
+            if not prices.empty
+            else pd.DataFrame()
+        )
+        multi_benchmark_summary = build_multi_benchmark_summary(
+            asset_only_prices, multi_benchmark_prices, windows, rf_daily=rf_daily
+        )
 
         sector_tickers = parse_sector_tickers(sector_text)
         sector_all = tuple(sorted(set(list(sector_tickers.values()) + [benchmark])))
-        sector_prices, sector_used_tickers, sector_failed_tickers = download_prices(sector_all, start, end)
-        sector_ranking, sector_rs = calc_metrics(sector_prices, benchmark, windows)
+        with st.spinner("Baixando índices setoriais…"):
+            sector_prices, sector_used_tickers, sector_failed_tickers, sector_gaps = download_prices(
+                sector_all, start, end
+            )
+        sector_ranking, sector_rs = calc_metrics(sector_prices, benchmark, windows, rf_daily=rf_daily)
         if not sector_ranking.empty:
             inverse = {yahoo_to_br(v): k for k, v in sector_tickers.items()}
             sector_ranking["Índice"] = sector_ranking["Ativo"].map(inverse).fillna(sector_ranking["Ativo"])
@@ -946,27 +1098,31 @@ if run:
             "benchmark": benchmark,
             "benchmark_label": benchmark_label,
             "windows": windows,
+            "rf_daily": rf_daily,
             "failed_tickers": failed_tickers,
+            "gap_warnings": gap_warnings,
             "sector_prices": sector_prices,
             "sector_ranking": sector_ranking,
             "sector_rs": sector_rs,
             "sector_used_tickers": sector_used_tickers,
             "sector_failed_tickers": sector_failed_tickers,
+            "sector_gaps": sector_gaps,
             "sector_tickers": sector_tickers,
             "multi_benchmark_prices": multi_benchmark_prices,
             "multi_benchmark_used": multi_benchmark_used,
             "multi_benchmark_failed": multi_benchmark_failed,
+            "multi_benchmark_gaps": multi_benchmark_gaps,
             "multi_benchmark_summary": multi_benchmark_summary,
         }
         st.session_state.analysis_ready = True
-        st.success("Dados atualizados e armazenados na sessão. Agora você pode trocar o ativo no indicador sem recalcular.")
+        st.success("Análise concluída. Troque o ativo na aba Indicador Score sem precisar recalcular.")
     except Exception as e:
         st.error(f"Erro ao atualizar a análise: {e}")
         st.exception(e)
         st.stop()
 
 if not st.session_state.analysis_ready:
-    st.info("Configure os parâmetros na lateral e clique em Atualizar análise.")
+    st.info("Configure os parâmetros na lateral e clique em **Atualizar análise**.")
     st.stop()
 
 try:
@@ -977,38 +1133,53 @@ try:
     benchmark = data["benchmark"]
     benchmark_label = data.get("benchmark_label", benchmark)
     windows = data["windows"]
+    rf_daily = data.get("rf_daily", 0.0)
     failed_tickers = data["failed_tickers"]
+    gap_warnings = data.get("gap_warnings", {})
     sector_ranking = data["sector_ranking"]
     sector_used_tickers = data["sector_used_tickers"]
     sector_failed_tickers = data["sector_failed_tickers"]
+    sector_gaps = data.get("sector_gaps", {})
     multi_benchmark_summary = data.get("multi_benchmark_summary", pd.DataFrame())
     multi_benchmark_failed = data.get("multi_benchmark_failed", [])
+    multi_benchmark_gaps = data.get("multi_benchmark_gaps", {})
 
+    # ── Avisos globais de qualidade de dados ──────────────────────────────────
     if failed_tickers:
-        st.warning("Alguns tickers não retornaram dados no Yahoo Finance e foram ignorados: " + ", ".join(failed_tickers))
+        st.warning(
+            "Tickers sem dados no Yahoo Finance (ignorados): "
+            + ", ".join(yahoo_to_br(t) for t in failed_tickers)
+        )
+    render_gap_warnings(gap_warnings, label="Ativos")
+    render_gap_warnings(sector_gaps, label="Setores")
+    render_gap_warnings(multi_benchmark_gaps, label="Multi-benchmark")
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Ranking ativos", "Setores", "Linha RS", "Indicador Score", "Mapa de calor", "Multi-benchmark"])
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+        ["Ranking ativos", "Setores", "Linha RS", "Indicador Score", "Mapa de calor", "Multi-benchmark"]
+    )
 
     with tab1:
-        render_table(ranking, f"Ranking de ativos contra {benchmark_label}", show_score_explanation=True, show_regime_explanation=True)
+        render_table(
+            ranking, f"Ranking de ativos contra {benchmark_label}",
+            show_score_explanation=True, show_regime_explanation=True,
+        )
         if not ranking.empty:
             fig = px.bar(
-                ranking.head(top_n),
-                x="Ativo",
-                y="Score",
-                color="Regime",
+                ranking.head(top_n), x="Ativo", y="Score", color="Regime",
                 color_discrete_map=REGIME_COLOR_MAP,
                 title=f"Top ativos por Score relativo contra {benchmark_label}",
             )
             st.plotly_chart(fig, width="stretch")
 
             if "Score Sortino" in ranking.columns:
-                sortino_rank = ranking.dropna(subset=["Score Sortino"]).sort_values("Score Sortino", ascending=False).head(top_n)
+                sortino_rank = (
+                    ranking.dropna(subset=["Score Sortino"])
+                    .sort_values("Score Sortino", ascending=False)
+                    .head(top_n)
+                )
                 if not sortino_rank.empty:
                     fig_sortino = px.bar(
-                        sortino_rank,
-                        x="Ativo",
-                        y="Score Sortino",
+                        sortino_rank, x="Ativo", y="Score Sortino",
                         color="Qualidade Premium" if "Qualidade Premium" in sortino_rank.columns else "Regime",
                         color_discrete_map={
                             "Premium Sortino": "#004D40",
@@ -1021,33 +1192,37 @@ try:
                     )
                     st.plotly_chart(fig_sortino, width="stretch")
                     st.caption(
-                        "Score Sortino puro = Score Simples × Fator Sortino. Ele favorece ativos cuja força relativa veio com menor volatilidade negativa, útil para swing e carrego com opções."
+                        "Score Sortino puro = Score Simples × Fator Sortino. "
+                        "Favorece ativos com força relativa e menor volatilidade negativa."
                     )
 
     with tab2:
         if sector_used_tickers:
-            used_df = pd.DataFrame([{"Ticker solicitado": k, "Ticker usado": v} for k, v in sector_used_tickers.items() if k != benchmark])
+            used_df = pd.DataFrame([
+                {"Ticker solicitado": k, "Ticker usado": v}
+                for k, v in sector_used_tickers.items() if k != benchmark
+            ])
             if not used_df.empty:
                 st.caption("Tickers efetivamente usados na análise setorial:")
                 st.dataframe(used_df, width="stretch", hide_index=True)
         if sector_failed_tickers:
             missing = [t for t in sector_failed_tickers if t != benchmark]
             if missing:
-                st.warning("Sem dados para: " + ", ".join(missing) + ". Esses índices foram ignorados no ranking setorial.")
+                st.warning("Sem dados para: " + ", ".join(missing) + ". Ignorados no ranking setorial.")
         if not sector_ranking.empty:
             cols = ["Índice"] + [c for c in sector_ranking.columns if c != "Índice"]
-            render_table(sector_ranking[cols], f"Ranking setorial contra {benchmark_label}", show_score_explanation=True, show_regime_explanation=True)
+            render_table(
+                sector_ranking[cols], f"Ranking setorial contra {benchmark_label}",
+                show_score_explanation=True, show_regime_explanation=True,
+            )
             fig2 = px.bar(
-                sector_ranking,
-                x="Índice",
-                y="Score",
-                color="Regime",
+                sector_ranking, x="Índice", y="Score", color="Regime",
                 color_discrete_map=REGIME_COLOR_MAP,
                 title="Setores/índices com maior força relativa",
             )
             st.plotly_chart(fig2, width="stretch")
         else:
-            st.warning("Não consegui baixar dados suficientes para os índices setoriais informados. Ajuste os tickers na lateral e clique em Atualizar análise.")
+            st.warning("Sem dados para os índices setoriais. Ajuste os tickers e clique em Atualizar análise.")
 
     with tab3:
         render_rs_explanation()
@@ -1055,7 +1230,11 @@ try:
             st.warning("Sem curvas de força relativa.")
         else:
             options = ranking["Ativo"].head(30).tolist()
-            selected = st.multiselect("Ativos para comparar", options, default=options[: min(5, len(options))], key="rs_line_assets")
+            selected = st.multiselect(
+                "Ativos para comparar", options,
+                default=options[: min(5, len(options))],
+                key="rs_line_assets",
+            )
             fig3 = go.Figure()
             for br in selected:
                 ytk = f"{br}.SA"
@@ -1063,16 +1242,12 @@ try:
                     fig3.add_trace(go.Scatter(x=rs_curves.index, y=rs_curves[ytk], mode="lines", name=br))
             fig3.update_layout(
                 title=f"Linha de Força Relativa normalizada — Ativo / {benchmark_label}, base 100",
-                yaxis_title="RS base 100",
-                xaxis_title="Data",
-                hovermode="x unified",
-                height=620,
+                yaxis_title="RS base 100", xaxis_title="Data",
+                hovermode="x unified", height=620,
             )
             enable_horizontal_zoom(fig3, range_slider=True)
             plotly_time_chart(fig3, key="rs_line_chart")
-            st.caption(
-                "Use os botões 1m/3m/6m/1a/Tudo, arraste o range slider inferior ou use a roda do mouse para ajustar o zoom no eixo horizontal."
-            )
+            st.caption("Use os botões 1m/3m/6m/1a/Tudo, o range slider ou a roda do mouse para zoom horizontal.")
 
     with tab4:
         if ranking.empty or prices.empty:
@@ -1086,23 +1261,17 @@ try:
             render_regime_explanation()
             selected_score_asset = st.selectbox(
                 "Ativo para o indicador visual",
-                score_options,
-                index=0,
-                key="selected_score_asset",
+                score_options, index=0, key="selected_score_asset",
             )
             selected_col = f"{selected_score_asset}.SA"
             if selected_col not in prices.columns and selected_score_asset in prices.columns:
                 selected_col = selected_score_asset
             render_score_indicator(
-                prices,
-                selected_col,
-                benchmark,
-                windows,
+                prices, selected_col, benchmark, windows,
                 title=f"Indicador visual de Score Relativo — {selected_score_asset} x {benchmark_label}",
+                rf_daily=rf_daily,
             )
-            st.caption(
-                "Use os botões 1m/3m/6m/1a/Tudo, arraste o range slider inferior ou use a roda do mouse para ajustar o zoom no eixo horizontal."
-            )
+            st.caption("Use os botões 1m/3m/6m/1a/Tudo, o range slider ou a roda do mouse para zoom horizontal.")
 
     with tab5:
         if ranking.empty:
@@ -1110,32 +1279,34 @@ try:
         else:
             rel_cols = [c for c in ranking.columns if c.startswith("Relativo")]
             heat = ranking.set_index("Ativo")[rel_cols].head(50)
-            fig4 = px.imshow(heat, aspect="auto", text_auto=".1f", title=f"Mapa de calor: retorno relativo contra {benchmark_label} (%)")
+            fig4 = px.imshow(
+                heat, aspect="auto", text_auto=".1f",
+                title=f"Mapa de calor: retorno relativo contra {benchmark_label} (%)",
+            )
             st.plotly_chart(fig4, width="stretch")
-
 
     with tab6:
         st.subheader("Radar multi-benchmark")
         st.markdown(
             """
-Este painel compara os mesmos ativos simultaneamente contra os benchmarks fixos: **IBOV**, **SPX**, **NASDAQ** e **DXY**.
+Compara os ativos simultaneamente contra **IBOV**, **SPX**, **NASDAQ** e **DXY**.
 
-A coluna **Score Multi-Benchmark** é a média dos Scores Elite disponíveis contra cada benchmark.
-A coluna **Consistência** mostra em quantos benchmarks o ativo está com Score Elite positivo.
+- **Score Multi-Benchmark**: média dos Scores Elite disponíveis em cada benchmark.
+- **Consistência**: em quantos benchmarks o ativo tem Score Elite positivo.
             """
         )
         if multi_benchmark_failed:
-            st.warning("Alguns benchmarks fixos não retornaram dados e foram ignorados: " + ", ".join(multi_benchmark_failed))
+            st.warning("Benchmarks fixos sem dados (ignorados): " + ", ".join(multi_benchmark_failed))
         if multi_benchmark_summary.empty:
-            st.warning("Sem dados suficientes para montar o radar multi-benchmark.")
+            st.warning("Sem dados suficientes para o radar multi-benchmark.")
         else:
-            render_table(multi_benchmark_summary, "Ranking multi-benchmark", show_score_explanation=False, show_regime_explanation=True)
+            render_table(
+                multi_benchmark_summary, "Ranking multi-benchmark",
+                show_score_explanation=False, show_regime_explanation=True,
+            )
             mb_top = multi_benchmark_summary.head(top_n)
             fig_mb = px.bar(
-                mb_top,
-                x="Ativo",
-                y="Score Multi-Benchmark",
-                color="Regime",
+                mb_top, x="Ativo", y="Score Multi-Benchmark", color="Regime",
                 color_discrete_map=REGIME_COLOR_MAP,
                 title="Top ativos por Score Multi-Benchmark",
             )
@@ -1145,9 +1316,7 @@ A coluna **Consistência** mostra em quantos benchmarks o ativo está com Score 
             if heat_cols:
                 heat_mb = multi_benchmark_summary.set_index("Ativo")[heat_cols].head(50)
                 fig_mb_heat = px.imshow(
-                    heat_mb,
-                    aspect="auto",
-                    text_auto=".1f",
+                    heat_mb, aspect="auto", text_auto=".1f",
                     title="Mapa de calor multi-benchmark — Score Elite por benchmark",
                 )
                 st.plotly_chart(fig_mb_heat, width="stretch")

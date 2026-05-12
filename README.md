@@ -1,45 +1,7 @@
-# Força Relativa B3 x IBOV — Versão ELITE
+# Força Relativa B3 x Benchmarks — Versão ELITE
 
-App em Streamlit para ranking de força relativa de ativos da B3 contra o Ibovespa.
-
-## Principais recursos
-
-- Ranking de ativos contra o IBOV.
-- Análise setorial restrita a IFNC, IMAT, ICON, UTIL e IMOB.
-- Opção de carteira automática do IBOV via B3, lista manual ou upload CSV.
-- Linha de força relativa `Ativo / IBOV`, normalizada em base 100.
-- Indicador visual do Score com linha zero, MM20 e histograma.
-- Mapa de calor das janelas relativas.
-- Score Simples e Score Elite.
-
-## Score Simples
-
-O Score Simples é a média ponderada dos retornos relativos contra o IBOV:
-
-`Relativo Nd % = Retorno do ativo em N pregões - Retorno do IBOV em N pregões`
-
-Pesos padrão:
-
-- 5 pregões: 10%
-- 20 pregões: 30%
-- 60 pregões: 30%
-- 120 pregões: 30%
-- 252 pregões: 10%
-
-Quando uma janela não está selecionada ou não possui dados suficientes, o app recalibra usando apenas as janelas disponíveis.
-
-## Score Elite com Sharpe + Sortino
-
-O Score Elite pondera o Score Simples pelo fator de qualidade:
-
-`Score Elite = Score Simples × Fator de Qualidade`
-
-O Fator de Qualidade usa:
-
-- 60% Sharpe 20d
-- 40% Sortino 20d
-
-Ambos são calculados com retornos logarítmicos diários, sem anualizar. O fator é limitado entre 0,25 e 2,00 para evitar distorções por outliers e para não inverter o sinal da força relativa.
+App em Streamlit para ranking de força relativa de ativos da B3 contra benchmarks configuráveis,
+com Score Elite ajustado por Sharpe e Sortino descontados pelo CDI.
 
 ## Como rodar
 
@@ -48,77 +10,145 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+---
 
-## Atualização desta versão
+## Novidades desta versão
 
-A aba **Indicador Score** agora plota duas linhas:
+| Melhoria | Descrição |
+|---|---|
+| **CDI/Selic configurável** | Sharpe e Sortino agora descontam o custo de oportunidade real do mercado brasileiro. Ajuste na barra lateral. |
+| **Download em lote** | Tenta baixar todos os tickers em uma única requisição (`threads=True`) antes de recorrer a aliases individuais. Muito mais rápido para o universo completo do IBOV (~70 tickers). |
+| **Pesos corrigidos** | `SCORE_WEIGHTS` agora somam exatamente **1,00** (era 1,10 na versão anterior). |
+| **`ffill(limit=3)`** | Preenchimento máximo de 3 dias consecutivos de dados faltantes. Evita propagar preços obsoletos em suspensões ou circuit breakers. |
+| **Avisos de gaps** | A interface exibe alerta para ativos com buracos de preço superiores a 3 pregões antes do ffill. |
+| **`min_periods` consistente** | `rolling_quality_factor` e `rolling_sortino_factor` agora usam `min_periods` igual em todas as janelas rolling, eliminando assimetria entre Sharpe e Sortino nas primeiras observações do histórico. |
 
-- **Score Simples**: força relativa pura contra o IBOV.
-- **Score Elite**: Score Simples ponderado pelo fator de qualidade Sharpe + Sortino.
+---
 
-Também foram adicionados comentários na interface explicando:
+## Principais recursos
 
-- Relativo por janela;
-- Score Simples;
-- Sharpe 20d;
-- Sortino 20d;
-- Fator de Qualidade;
-- Score Elite;
-- interpretação prática do gráfico.
+- Ranking de ativos contra benchmark configurável (IBOV, SPX, NASDAQ, DXY ou ticker personalizado).
+- Análise setorial restrita a IFNC, IMAT, ICON, UTIL e IMOB.
+- Fonte de ativos: carteira automática do IBOV via B3, lista manual ou upload CSV.
+- Linha de força relativa `Ativo / Benchmark` normalizada em base 100.
+- Indicador visual do Score (histograma, MM20, Score Curto Elite, Score Sortino).
+- Mapa de calor das janelas relativas.
+- Análise multi-benchmark simultânea (IBOV, SPX, NASDAQ e DXY).
 
-## Benchmark
+---
 
-O app agora possui uma seleção fixa de benchmark com nomes amigáveis:
+## Score Simples
 
-- IBOV → `^BVSP`
-- SPX → `^SPX`
-- NASDAQ → `^IXIC`
+Média ponderada dos retornos relativos contra o benchmark:
 
-Também existe um campo opcional para benchmark personalizado. Quando preenchido, ele substitui a opção fixa selecionada.
+`Relativo Nd % = Retorno do ativo em N pregões − Retorno do benchmark em N pregões`
 
-## Indicador de Perda de Força Relativa (PFR)
+### Pesos por janela (somam 1,00)
 
-Esta versão inclui o **PFR**, criado para identificar liderança passada com perda de tração recente.
+| Janela     | Peso |
+|-----------:|-----:|
+| 5 pregões  |  10% |
+| 20 pregões |  25% |
+| 60 pregões |  30% |
+| 120 pregões | 25% |
+| 252 pregões | 10% |
 
-O PFR é ativado apenas quando o ativo ainda tem **Relativo 60d positivo**. A partir disso, soma pontos:
+Quando uma janela não está selecionada ou sem dados, o Score é renormalizado automaticamente
+pela divisão por `used_weight` (soma dos pesos das janelas efetivamente calculadas).
 
-- Relativo 20d < 0: +2 pontos
-- Relativo 5d < 0: +1 ponto
-- Linha RS abaixo da MM20: +1 ponto
-- Score Elite < 0: +1 ponto
+---
 
-Classificação:
+## Score Elite
 
-- 0: Sem alerta
-- 1: Monitorar
-- 2 a 3: Atenção: perdendo força
-- 4 ou mais: Perda confirmada
+`Score Elite = Score Simples × Fator de Qualidade`
 
-Na aba **Indicador Score**, os alertas relevantes aparecem como marcadores triangulares no gráfico.
+O **Fator de Qualidade** combina:
+- 60% Sharpe 20d
+- 40% Sortino 20d
 
-## Benchmarks fixos
+Ambos calculados com retornos logarítmicos diários **descontados pelo CDI** configurado na sidebar.
+O fator é limitado entre **0,25×** e **2,00×** para evitar inversão de sinal por outliers.
 
-- IBOV → `^BVSP`
-- SPX → `^SPX`
-- NASDAQ → `^IXIC`
-- DXY (Dollar Index) → `DX-Y.NYB`
+### Por que descontar o CDI?
 
-## Atualização — Score Sortino puro
+Em um ambiente de juros altos (Selic ≥ 10% a.a.), ativos que apenas acompanham a taxa básica
+não deveriam ser premiados no Fator de Qualidade. O excesso de retorno sobre o CDI é o
+componente informativo para o Sharpe e o Sortino.
 
-Esta versão adiciona o **Score Sortino puro**:
+`rf_daily = (1 + CDI_anual) ^ (1/252) − 1`
+
+---
+
+## Score Sortino puro
 
 `Score Sortino = Score Simples × Fator Sortino`
 
-Onde:
+`Fator Sortino = clip(1 + Sortino 20d / 2, 0,25, 2,00)`
 
-`Fator Sortino = 1 + (Sortino 20d / 2)`, limitado entre `0,25x` e `2,00x`.
+Leitura defensiva que penaliza apenas volatilidade negativa.
+Útil para swing trade e carrego com opções.
 
-O objetivo é criar uma leitura mais defensiva da força relativa, favorecendo ativos que performam bem contra o benchmark com menor volatilidade negativa. Isso é especialmente útil para swing trade e carrego um pouco mais longo com opções.
+---
 
-O app agora inclui:
+## Score Curto 5/20
 
-- coluna **Fator Sortino**;
-- coluna **Score Sortino**;
-- coluna **Qualidade Premium**;
-- gráfico adicional de Top Ativos por Score Sortino;
-- linha **Score Sortino puro** no gráfico do Indicador Score.
+`Score Curto = 0,30 × Relativo 5d + 0,70 × Relativo 20d`
+
+Versão tática do Score para timing de entrada e saída. Vira antes do Score estrutural.
+
+`Score Curto Elite = Score Curto × Fator de Qualidade`
+
+---
+
+## Download de preços
+
+### Estratégia em duas etapas
+
+1. **Lote (`threads=True`)** — baixa todos os tickers em uma única chamada ao Yahoo Finance.
+   Reduz o tempo de carga para carteiras grandes de minutos para segundos.
+2. **Aliases individuais** — para tickers que falharam no lote, tenta cada alias listado
+   em `YAHOO_TICKER_ALIASES` (ex.: `IFNC.SA` → `^IFNC`).
+
+### Qualidade dos dados
+
+- Gaps (NaN consecutivos) são detectados **antes** do preenchimento.
+- `ffill(limit=3)` propaga no máximo 3 pregões.
+- Tickers com gap > 3 dias geram aviso visível na interface.
+
+---
+
+## Benchmarks disponíveis
+
+| Nome               | Ticker Yahoo |
+|--------------------|-------------|
+| IBOV               | `^BVSP`     |
+| SPX                | `^SPX`      |
+| NASDAQ             | `^IXIC`     |
+| DXY (Dollar Index) | `DX-Y.NYB`  |
+
+Qualquer ticker válido do Yahoo Finance pode ser usado como benchmark personalizado.
+
+---
+
+## Regime de força relativa
+
+| Regime              | Critério                                          |
+|---------------------|--------------------------------------------------|
+| Liderança relativa  | Rel. 20d > 0, Rel. 60d > 0 e RS > MM20          |
+| Virando para cima   | Rel. 20d > 0, Rel. 60d < 0 e RS > MM20          |
+| Perdendo força      | Rel. 20d < 0 e Rel. 60d > 0                     |
+| Underperform        | Rel. 20d < 0, Rel. 60d < 0 e RS < MM20          |
+| Neutro              | Critérios mistos ou dados insuficientes          |
+
+---
+
+## Requisitos
+
+```
+streamlit>=1.36
+pandas>=2.0
+numpy>=1.24
+yfinance>=0.2.40
+plotly>=5.20
+requests>=2.31
+```
